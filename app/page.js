@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 
 function extractVideoId(input) {
   try {
@@ -24,6 +25,8 @@ export default function Home() {
   const [url, setUrl] = useState("");
   const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState(false);
+  const router = useRouter();
+  const apiBaseUrl = process.env.NEXT_PUBLIC_FLASK_API_URL ?? "http://127.0.0.1:5000";
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -37,22 +40,23 @@ export default function Home() {
         return;
       }
 
+      // Preflight the backend so we fail fast on the homepage if API/transcript is unavailable.
       const response = await fetch(
-        `http://127.0.0.1:5000/transcript?video_id=${encodeURIComponent(videoId)}`
+        `${apiBaseUrl}/transcript?video_id=${encodeURIComponent(videoId)}`
       );
       const payload = await response.json();
 
       if (!response.ok) {
-        setStatus({ error: payload.error ?? "Failed to fetch transcript." });
+        setStatus({ error: payload.error ?? "Failed to validate transcript." });
         return;
       }
 
-      const count = Array.isArray(payload.transcript)
-        ? payload.transcript.length
-        : 0;
-      setStatus({ success: `Fetched transcript with ${count} segments.` });
+      router.push(`/workspace?v=${encodeURIComponent(videoId)}`);
     } catch {
-      setStatus({ error: "Could not connect to Flask API on port 5000." });
+      setStatus({
+        error:
+          "Could not connect to the Flask API. Make sure it is running on port 5000.",
+      });
     } finally {
       setLoading(false);
     }

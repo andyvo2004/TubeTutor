@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from langchain_openai import ChatOpenAI
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.formatters import JSONFormatter
 from youtube_transcript_api._errors import (
@@ -11,7 +13,7 @@ from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     VideoUnavailable,
 )
-from rag_engine import search_transcript_chunks, store_transcript_segments
+from rag_engine import ask_video_question, search_transcript_chunks, store_transcript_segments
 
 app = Flask(__name__)
 ytt_api = YouTubeTranscriptApi()
@@ -23,6 +25,7 @@ CORS(
         r"/transcript": {"origins": ["http://localhost:3000"]},
         r"/process": {"origins": ["http://localhost:3000"]},
         r"/search": {"origins": ["http://localhost:3000"]},
+        r"/chat": {"origins": ["http://localhost:3000"]},
     },
 )
 
@@ -119,6 +122,64 @@ def search_transcript():
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
         return jsonify({"error": "Failed to search transcript.", "details": str(exc)}), 500
+
+
+@app.post("/chat")
+def chat_with_video_context():
+    payload = request.get_json(silent=True) or {}
+    video_id = str(payload.get("video_id", "")).strip()
+    question = str(payload.get("question", "")).strip()
+
+    if not video_id:
+        return jsonify({"error": "Missing required field: video_id"}), 400
+    if not question:
+        return jsonify({"error": "Missing required field: question"}), 400
+
+    try:
+        context = ask_video_question(video_id=video_id, user_question=question)
+
+        openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        if not openrouter_api_key:
+            return jsonify({"error": "Missing OPENROUTER_API_KEY environment variable."}), 500
+
+        chat_model = ChatOpenAI(
+            api_key=openrouter_api_key,
+            base_url="https://openrouter.ai/api/v1",
+            model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+            temperature=0,
+        )
+
+        system_prompt = (
+            "You are a helpful study assistant. Answer the user's question using ONLY "
+            "the provided transcript context. If the answer is not in the context, "
+            "say 'I cannot find the answer in this video.'"
+        )
+        user_prompt = (
+            f"Transcript context:\n{context}\n\n"
+            f"User question:\n{question}"
+        )
+
+        response = chat_model.invoke(
+            [
+                ("system", system_prompt),
+                ("human", user_prompt),
+            ]
+        )
+
+        return (
+            jsonify(
+                {
+                    "video_id": video_id,
+                    "question": question,
+                    "answer": response.content,
+                }
+            ),
+            200,
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": "Failed to generate answer.", "details": str(exc)}), 500
 
 
 if __name__ == "__main__":

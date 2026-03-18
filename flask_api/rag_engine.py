@@ -106,3 +106,37 @@ def search_transcript_chunks(video_id: str, query: str, k: int = 3) -> list[dict
         )
 
     return results
+
+
+def ask_video_question(video_id: str, user_question: str) -> str:
+    normalized_question = user_question.strip()
+    if not normalized_question:
+        raise ValueError("Question is required.")
+
+    chroma_client = PersistentClient(path="./chroma_db")
+    collection_name = _to_collection_name(video_id)
+
+    # Ensure the collection exists before searching.
+    try:
+        chroma_client.get_collection(collection_name)
+    except Exception as exc:
+        raise ValueError(
+            "No processed transcript found for this video. Run /process first."
+        ) from exc
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+    vectorstore = Chroma(
+        client=chroma_client,
+        collection_name=collection_name,
+        embedding_function=embeddings,
+    )
+
+    top_matches = vectorstore.similarity_search(
+        query=normalized_question,
+        k=4,
+    )
+
+    context_chunks = [doc.page_content.strip() for doc in top_matches if doc.page_content]
+    return "\n\n".join(context_chunks)

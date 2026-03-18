@@ -1,11 +1,12 @@
 "use client";
 
-import { useState, useEffect, Suspense } from "react";
+import { useState, useEffect, Suspense, useRef } from "react";
 import { useSearchParams } from "next/navigation";
 import React from "react";
 
 type Tab = "transcript" | "summary" | "quiz";
 type ProcessingStatus = "idle" | "processing" | "ready" | "failed";
+type ChatMessage = { role: "user" | "ai"; content: string };
 
 function WorkspaceContent() {
   const searchParams = useSearchParams();
@@ -147,7 +148,7 @@ function WorkspaceContent() {
                 processStats={processStats}
               />
             )}
-            {activeTab === "summary" && <SummaryPanel />}
+            {activeTab === "summary" && <SummaryPanel videoId={videoId} apiBaseUrl={apiBaseUrl} />}
             {activeTab === "quiz" && <QuizPanel />}
           </div>
         </section>
@@ -223,13 +224,11 @@ function TranscriptPanel({
   );
 }
 
-function SummaryPanel() {
+function SummaryPanel({ videoId, apiBaseUrl }: { videoId: string; apiBaseUrl: string }) {
   return (
-    <div className="space-y-3">
+    <div className="space-y-3 h-full min-h-0">
       <h3 className="text-lg font-semibold text-gray-900">Summary</h3>
-      <p className="text-sm text-gray-500">
-        An AI-generated summary of the video will appear here.
-      </p>
+      <ChatAssistant videoId={videoId} apiBaseUrl={apiBaseUrl} />
     </div>
   );
 }
@@ -241,6 +240,121 @@ function QuizPanel() {
       <p className="text-sm text-gray-500">
         AI-generated quiz questions based on the video content will appear here.
       </p>
+    </div>
+  );
+}
+
+function ChatAssistant({ videoId, apiBaseUrl }: { videoId: string; apiBaseUrl: string }) {
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [question, setQuestion] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, isLoading]);
+
+  const onSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    const trimmedQuestion = question.trim();
+    if (!trimmedQuestion || isLoading) {
+      return;
+    }
+
+    if (!videoId) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "ai", content: "Missing video_id. Open a video workspace first." },
+      ]);
+      return;
+    }
+
+    setMessages((prev) => [...prev, { role: "user", content: trimmedQuestion }]);
+    setQuestion("");
+    setIsLoading(true);
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          video_id: videoId,
+          question: trimmedQuestion,
+        }),
+      });
+
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to get an answer from the assistant.");
+      }
+
+      const answer =
+        typeof data.answer === "string" && data.answer.trim()
+          ? data.answer
+          : "I cannot find the answer in this video.";
+
+      setMessages((prev) => [...prev, { role: "ai", content: answer }]);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to get an answer from the assistant.";
+
+      setMessages((prev) => [...prev, { role: "ai", content: message }]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="h-full min-h-0 rounded-xl border border-gray-200 bg-white shadow-sm flex flex-col overflow-hidden">
+      <div className="flex-1 min-h-0 overflow-y-auto px-4 py-4 space-y-3 bg-gray-50">
+        {messages.length === 0 && (
+          <p className="text-sm text-gray-500">
+            Ask any question about this video. Your chat history will appear here.
+          </p>
+        )}
+
+        {messages.map((message, index) => (
+          <div
+            key={`${message.role}-${index}`}
+            className={`max-w-[90%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap ${
+              message.role === "user"
+                ? "ml-auto bg-blue-600 text-white"
+                : "mr-auto bg-white text-gray-800 border border-gray-200"
+            }`}
+          >
+            {message.content}
+          </div>
+        ))}
+
+        {isLoading && (
+          <div className="mr-auto bg-white text-gray-700 border border-gray-200 rounded-2xl px-4 py-2.5 text-sm">
+            Thinking...
+          </div>
+        )}
+
+        <div ref={bottomRef} />
+      </div>
+
+      <form onSubmit={onSubmit} className="shrink-0 border-t border-gray-200 bg-white p-3 sticky bottom-0">
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={question}
+            onChange={(event) => setQuestion(event.target.value)}
+            placeholder="Ask about this video..."
+            className="flex-1 rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            disabled={isLoading}
+          />
+          <button
+            type="submit"
+            disabled={isLoading || !question.trim()}
+            className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50 disabled:cursor-not-allowed hover:bg-blue-700 transition-colors"
+          >
+            {isLoading ? "Sending..." : "Send"}
+          </button>
+        </div>
+      </form>
     </div>
   );
 }

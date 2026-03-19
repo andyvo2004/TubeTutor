@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from langchain_openai import ChatOpenAI
@@ -26,6 +27,7 @@ CORS(
         r"/process": {"origins": ["http://localhost:3000"]},
         r"/search": {"origins": ["http://localhost:3000"]},
         r"/chat": {"origins": ["http://localhost:3000"]},
+        r"/generate_quiz": {"origins": ["http://localhost:3000"]},
     },
 )
 
@@ -180,6 +182,99 @@ def chat_with_video_context():
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
         return jsonify({"error": "Failed to generate answer.", "details": str(exc)}), 500
+
+
+@app.post("/generate_quiz")
+def generate_quiz():
+    payload = request.get_json(silent=True) or {}
+    video_id = str(payload.get("video_id", "")).strip()
+    quiz_nonce = str(payload.get("quiz_nonce", "")).strip() or str(random.randint(100000, 999999))
+
+    if not video_id:
+        return jsonify({"error": "Missing required field: video_id"}), 400
+
+    try:
+        # Retrieve transcript context (up to 5000 characters)
+        try:
+            # Use multiple generic queries to get diverse content chunks
+            transcript_chunks = search_transcript_chunks(video_id=video_id, query="main topic summary overview", k=10)
+            # Shuffle chunk order based on nonce to vary context composition between generations.
+            shuffled_chunks = list(transcript_chunks)
+            random.Random(quiz_nonce).shuffle(shuffled_chunks)
+            context = "\n\n".join([chunk["text"] for chunk in shuffled_chunks])
+            # Truncate to 5000 characters
+            context = context[:5000] if context else ""
+        except ValueError as e:
+            # If no processed transcript found, return error
+            return jsonify({"error": f"No processed transcript found for this video. Run /process first. ({str(e)})"}), 400
+
+        if not context or len(context.strip()) == 0:
+            return jsonify({"error": "Could not retrieve transcript context for quiz generation. Transcript may be empty."}), 400
+
+        # Get OpenRouter API key
+        openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        if not openrouter_api_key:
+            return jsonify({"error": "Missing OPENROUTER_API_KEY environment variable."}), 500
+
+        # Configure LangChain ChatOpenAI for OpenRouter
+        # Using a model good at JSON generation (gpt-4o-mini or claude)
+        chat_model = ChatOpenAI(
+            api_key=openrouter_api_key,
+            base_url="https://openrouter.ai/api/v1",
+            model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+            temperature=float(os.getenv("QUIZ_TEMPERATURE", "0.8")),
+        )
+
+        # System prompt that strictly demands JSON response
+        system_prompt = (
+            "You are an expert quiz generator. Generate exactly 5 multiple-choice questions "
+            "based on the provided transcript context. "
+            "Your response MUST be ONLY a valid JSON object with no additional text. "
+            "The JSON MUST have this exact format:\n"
+            '{"questions": [{"question": "text", "options": ["A", "B", "C", "D"], "answer": "A"}]}\n'
+            "Each question must have exactly 4 options (A, B, C, D) and the answer must be one of those letters. "
+            "Generate questions that test understanding of the key concepts in the transcript."
+        )
+
+        user_prompt = (
+            f"Transcript context:\n{context}\n\n"
+            f"Variation key: {quiz_nonce}\n"
+            "Generate 5 multiple-choice questions."
+        )
+
+        # Invoke the model
+        response = chat_model.invoke(
+            [
+                ("system", system_prompt),
+                ("human", user_prompt),
+            ]
+        )
+
+        # Parse the JSON response
+        try:
+            quiz_json = json.loads(response.content)
+        except json.JSONDecodeError as exc:
+            return jsonify({
+                "error": "Failed to parse quiz response as valid JSON.",
+                "details": str(exc),
+                "raw_response": response.content
+            }), 500
+
+        return (
+            jsonify(
+                {
+                    "video_id": video_id,
+                    "quiz_nonce": quiz_nonce,
+                    "quiz": quiz_json,
+                }
+            ),
+            200,
+        )
+
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": "Failed to generate quiz.", "details": str(exc)}), 500
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 import { useState, useEffect, Suspense, useRef } from "react";
 import { useSearchParams } from "next/navigation";
 import React from "react";
+import InteractiveQuiz from "@/components/InteractiveQuiz";
 
 type Tab = "transcript" | "summary" | "quiz";
 type ProcessingStatus = "idle" | "processing" | "ready" | "failed";
@@ -18,6 +19,9 @@ function WorkspaceContent() {
   const [indexError, setIndexError] = useState<string | null>(null);
   const [processingStatus, setProcessingStatus] = useState<ProcessingStatus>("idle");
   const [processStats, setProcessStats] = useState<{ segments: number; chunks: number } | null>(null);
+  const [quizData, setQuizData] = useState<any>(null);
+  const [quizLoading, setQuizLoading] = useState(false);
+  const [quizError, setQuizError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!videoId) return;
@@ -61,6 +65,49 @@ function WorkspaceContent() {
 
     return () => controller.abort();
   }, [videoId]);
+
+  // Generate quiz in background after transcript is processed
+  useEffect(() => {
+    if (!videoId || processingStatus !== "ready") return;
+
+    const generateQuiz = async () => {
+      setQuizLoading(true);
+      setQuizError(null);
+
+      try {
+        const response = await fetch(`${apiBaseUrl}/generate_quiz`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          cache: "no-store",
+          body: JSON.stringify({
+            video_id: videoId,
+            quiz_nonce: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          }),
+        });
+
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+          const errorMsg = data.error || `Server error (${response.status})`;
+          throw new Error(errorMsg);
+        }
+
+        if (!data.quiz || !data.quiz.questions || !Array.isArray(data.quiz.questions) || data.quiz.questions.length === 0) {
+          throw new Error("Invalid quiz format received from server.");
+        }
+
+        setQuizData(data.quiz.questions);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Failed to generate quiz. Please try again.";
+        setQuizError(message);
+        console.error("Quiz generation error:", err);
+      } finally {
+        setQuizLoading(false);
+      }
+    };
+
+    generateQuiz();
+  }, [videoId, processingStatus, apiBaseUrl]);
 
   const tabs: { key: Tab; label: string }[] = [
     { key: "transcript", label: "Transcript" },
@@ -149,7 +196,44 @@ function WorkspaceContent() {
               />
             )}
             {activeTab === "summary" && <SummaryPanel videoId={videoId} apiBaseUrl={apiBaseUrl} />}
-            {activeTab === "quiz" && <QuizPanel />}
+            {activeTab === "quiz" && (
+              <QuizPanel
+                videoId={videoId}
+                apiBaseUrl={apiBaseUrl}
+                quizData={quizData}
+                quizLoading={quizLoading}
+                quizError={quizError}
+                onRegenerate={() => {
+                  setQuizData(null);
+                  setQuizError(null);
+                  setQuizLoading(true);
+                  // Trigger quiz generation
+                  fetch(`${apiBaseUrl}/generate_quiz`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    cache: "no-store",
+                    body: JSON.stringify({
+                      video_id: videoId,
+                      quiz_nonce: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                    }),
+                  })
+                    .then((res) => res.json())
+                    .then((data) => {
+                      if (data.quiz?.questions) {
+                        setQuizData(data.quiz.questions);
+                      } else {
+                        throw new Error("Invalid quiz format");
+                      }
+                    })
+                    .catch((err) => {
+                      const message = err instanceof Error ? err.message : "Failed to generate quiz";
+                      setQuizError(message);
+                      console.error("Quiz regeneration error:", err);
+                    })
+                    .finally(() => setQuizLoading(false));
+                }}
+              />
+            )}
           </div>
         </section>
       </main>
@@ -233,13 +317,92 @@ function SummaryPanel({ videoId, apiBaseUrl }: { videoId: string; apiBaseUrl: st
   );
 }
 
-function QuizPanel() {
+function QuizPanel({
+  videoId,
+  apiBaseUrl,
+  quizData,
+  quizLoading,
+  quizError,
+  onRegenerate,
+}: {
+  videoId: string;
+  apiBaseUrl: string;
+  quizData: any;
+  quizLoading: boolean;
+  quizError: string | null;
+  onRegenerate: () => void;
+}) {
+  if (quizLoading) {
+    return (
+      <div className="space-y-3">
+        <h3 className="text-lg font-semibold text-gray-900">Quiz</h3>
+        <div className="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-3">
+          <div className="flex items-center gap-2 text-sm font-medium text-blue-700">
+            <svg
+              className="animate-spin h-4 w-4"
+              xmlns="http://www.w3.org/2000/svg"
+              fill="none"
+              viewBox="0 0 24 24"
+            >
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+            </svg>
+            <span>Generating your quiz...</span>
+          </div>
+          <div className="h-2 rounded-full bg-blue-100 overflow-hidden">
+            <div className="h-full w-1/2 bg-blue-500 animate-pulse" />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (quizError) {
+    return (
+      <div className="space-y-3">
+        <h3 className="text-lg font-semibold text-gray-900">Quiz</h3>
+        <div className="rounded-lg border border-red-200 bg-red-50 p-4 space-y-3">
+          <p className="text-sm text-red-600">{quizError}</p>
+          <p className="text-xs text-red-500">
+            Make sure the transcript has been processed first before generating a quiz.
+          </p>
+          <button
+            onClick={onRegenerate}
+            className="mt-3 w-full rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 transition-colors"
+          >
+            Try Again
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!quizData || quizData.length === 0) {
+    return (
+      <div className="space-y-3">
+        <h3 className="text-lg font-semibold text-gray-900">Quiz</h3>
+        <p className="text-sm text-gray-500">
+          AI-generated quiz questions based on the video content will appear here.
+        </p>
+      </div>
+    );
+  }
+
   return (
-    <div className="space-y-3">
-      <h3 className="text-lg font-semibold text-gray-900">Quiz</h3>
-      <p className="text-sm text-gray-500">
-        AI-generated quiz questions based on the video content will appear here.
-      </p>
+    <div className="space-y-3 h-full flex flex-col -m-5">
+      <div className="flex items-center justify-between gap-3 px-5 pt-3">
+        <h3 className="text-lg font-semibold text-gray-900">Quiz</h3>
+        <button
+          onClick={onRegenerate}
+          className="text-xs font-medium text-blue-600 hover:text-blue-700 px-3 py-1 rounded-full hover:bg-blue-50 transition-colors"
+          title="Generate a new quiz"
+        >
+          🔄 New Quiz
+        </button>
+      </div>
+      <div className="flex-1 min-h-0">
+        <InteractiveQuiz quizData={quizData} />
+      </div>
     </div>
   );
 }

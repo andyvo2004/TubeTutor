@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from langchain_openai import ChatOpenAI
@@ -19,6 +20,73 @@ from rag_engine import ask_video_question, search_transcript_chunks, store_trans
 app = Flask(__name__)
 ytt_api = YouTubeTranscriptApi()
 
+
+def _sanitize_study_guide_markdown(raw: str) -> str:
+    if not raw:
+        return ""
+
+    text = raw.replace("\r\n", "\n")
+    text = text.replace("\\n", "\n")
+
+    # Normalize common malformed delimiter patterns.
+    text = text.replace("\\$", "$")
+    text = re.sub(r"\${3,}", "$$", text)
+    text = re.sub(r"\$\$\s*\$+", "$$", text)
+    text = re.sub(r"\$+\s*\$\$", "$$", text)
+
+    # Convert \(...\) and \[...\] to markdown-math delimiters.
+    text = re.sub(r"\\\((.*?)\\\)", lambda m: f"${m.group(1).strip()}$", text, flags=re.S)
+    text = re.sub(r"\\\[(.*?)\\\]", lambda m: f"$$\n{m.group(1).strip()}\n$$", text, flags=re.S)
+
+    # Ensure begin/end blocks are valid display math blocks.
+    def _wrap_begin_end(match: re.Match[str]) -> str:
+        env = match.group(1)
+        body = match.group(2)
+        body = re.sub(r"\\{3,}", r"\\\\", body)
+        body = re.sub(r"\\\s+", r"\\\\ ", body)
+        body = re.sub(r"\n{3,}", "\n\n", body)
+        return f"$$\n\\begin{{{env}}}{body}\\end{{{env}}}\n$$"
+
+    text = re.sub(r"\\begin\{([a-zA-Z*]+)\}([\s\S]*?)\\end\{\1\}", _wrap_begin_end, text)
+
+    # Put headings on their own line.
+    text = re.sub(r"([^\n])\s+(#{1,6}\s+)", r"\1\n\n\2", text)
+
+    # Lift inline display-math segments to standalone lines.
+    rebuilt_lines: list[str] = []
+    for line in text.split("\n"):
+        current = line
+        guard = 0
+        produced = False
+        while guard < 20:
+            start = current.find("$$")
+            if start == -1:
+                break
+            end = current.find("$$", start + 2)
+            if end == -1:
+                break
+
+            before = current[:start].rstrip().rstrip(":")
+            math_body = current[start + 2 : end].strip()
+            after = current[end + 2 :].lstrip().lstrip(":").lstrip()
+
+            if before:
+                rebuilt_lines.append(before)
+            rebuilt_lines.append(f"$$\n{math_body}\n$$")
+            current = after
+            produced = True
+            guard += 1
+
+        if produced:
+            if current.strip():
+                rebuilt_lines.append(current.strip())
+        else:
+            rebuilt_lines.append(line)
+
+    text = "\n".join(rebuilt_lines)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
 # Allow the Next.js frontend to call this API from localhost:3000.
 CORS(
     app,
@@ -28,6 +96,7 @@ CORS(
         r"/search": {"origins": ["http://localhost:3000"]},
         r"/chat": {"origins": ["http://localhost:3000"]},
         r"/generate_quiz": {"origins": ["http://localhost:3000"]},
+        r"/summary": {"origins": ["http://localhost:3000"]},
     },
 )
 
@@ -147,7 +216,7 @@ def chat_with_video_context():
         chat_model = ChatOpenAI(
             api_key=openrouter_api_key,
             base_url="https://openrouter.ai/api/v1",
-            model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+            model=os.getenv("OPENROUTER_MODEL", "stepfun/step-3.5-flash:free"),
             temperature=0,
         )
 
@@ -217,11 +286,11 @@ def generate_quiz():
             return jsonify({"error": "Missing OPENROUTER_API_KEY environment variable."}), 500
 
         # Configure LangChain ChatOpenAI for OpenRouter
-        # Using a model good at JSON generation (gpt-4o-mini or claude)
+        # Using a free model with good JSON generation capabilities
         chat_model = ChatOpenAI(
             api_key=openrouter_api_key,
             base_url="https://openrouter.ai/api/v1",
-            model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+            model=os.getenv("OPENROUTER_MODEL", "stepfun/step-3.5-flash:free"),
             temperature=float(os.getenv("QUIZ_TEMPERATURE", "0.8")),
         )
 
@@ -231,8 +300,9 @@ def generate_quiz():
             "based on the provided transcript context. "
             "Your response MUST be ONLY a valid JSON object with no additional text. "
             "The JSON MUST have this exact format:\n"
-            '{"questions": [{"question": "text", "options": ["A", "B", "C", "D"], "answer": "A"}]}\n'
+            '{"questions": [{"question": "text", "options": ["A", "B", "C", "D"], "answer": "A", "explanation": "Overall explanation", "option_explanations": {"A": "Why A is right/wrong", "B": "Why B is right/wrong", "C": "Why C is right/wrong", "D": "Why D is right/wrong"}}]}\n'
             "Each question must have exactly 4 options (A, B, C, D) and the answer must be one of those letters. "
+            "Include both an overall explanation and per-option explanations so learners understand why each option is correct or incorrect. "
             "Generate questions that test understanding of the key concepts in the transcript."
         )
 
@@ -275,6 +345,95 @@ def generate_quiz():
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
         return jsonify({"error": "Failed to generate quiz.", "details": str(exc)}), 500
+
+
+@app.post("/summary")
+def generate_study_guide():
+    payload = request.get_json(silent=True) or {}
+    video_id = str(payload.get("video_id", "")).strip()
+
+    if not video_id:
+        return jsonify({"error": "Missing required field: video_id"}), 400
+
+    try:
+        # Fetch full transcript from YouTube
+        transcript = ytt_api.fetch(video_id)
+        transcript_segments = json.loads(JSONFormatter().format_transcript(transcript))
+        
+        # Reconstruct full transcript text
+        full_text = " ".join(
+            str(segment.get("text", "")).strip()
+            for segment in transcript_segments
+            if isinstance(segment, dict)
+        ).strip()
+
+        if not full_text:
+            return jsonify({"error": "Transcript is empty."}), 400
+
+        # Get OpenRouter API key
+        openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        if not openrouter_api_key:
+            return jsonify({"error": "Missing OPENROUTER_API_KEY environment variable."}), 500
+
+        # Configure LangChain ChatOpenAI for OpenRouter with a free model
+        chat_model = ChatOpenAI(
+            api_key=openrouter_api_key,
+            base_url="https://openrouter.ai/api/v1",
+            model="stepfun/step-3.5-flash:free",
+            temperature=0.7,
+        )
+
+        # System prompt for comprehensive study guide generation
+        system_prompt = (
+            "You are an expert professor and educational content creator. "
+            "Generate a comprehensive, well-structured study guide in valid Markdown based on the provided transcript.\n\n"
+            "Output requirements (strict):\n"
+            "- Use only valid Markdown.\n"
+            "- Use headings with #, ##, ### and put each heading on its own line.\n"
+            "- Use bullet lists with '-' only.\n"
+            "- Do NOT include raw backslashes before dollar signs. Never output \\$ or $$$.\n"
+            "- For inline math use $...$ only.\n"
+            "- For display math use $$...$$ only, and put display math on its own line.\n"
+            "- Never place $$...$$ in the middle of a sentence or bullet line.\n"
+            "- If using matrix notation, keep it valid LaTeX inside $$...$$ (e.g. \\begin{pmatrix} ... \\end{pmatrix}).\n"
+            "- Never mix plain text and heading markers on the same line.\n"
+            "- Return only the study guide Markdown (no preamble, no code fences).\n\n"
+            "The study guide MUST include these sections:\n"
+            "1. Overview (2-3 sentences)\n"
+            "2. Key Concepts (definitions and examples)\n"
+            "3. Takeaways (bulleted learning points)"
+        )
+
+        user_prompt = f"Transcript content:\n\n{full_text}"
+
+        # Invoke the model
+        response = chat_model.invoke(
+            [
+                ("system", system_prompt),
+                ("human", user_prompt),
+            ]
+        )
+
+        cleaned_summary = _sanitize_study_guide_markdown(str(response.content))
+
+        return (
+            jsonify(
+                {
+                    "video_id": video_id,
+                    "summary": cleaned_summary,
+                }
+            ),
+            200,
+        )
+
+    except TranscriptsDisabled:
+        return jsonify({"error": "Transcripts are disabled for this video."}), 403
+    except (InvalidVideoId, VideoUnavailable):
+        return jsonify({"error": "Invalid or unavailable video_id."}), 404
+    except NoTranscriptFound:
+        return jsonify({"error": "No transcript found for this video."}), 404
+    except Exception as exc:
+        return jsonify({"error": "Failed to generate study guide.", "details": str(exc)}), 500
 
 
 if __name__ == "__main__":

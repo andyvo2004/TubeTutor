@@ -1,13 +1,206 @@
 "use client";
 
 import { useState, useEffect, Suspense, useRef } from "react";
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import React from "react";
 import InteractiveQuiz from "@/components/InteractiveQuiz";
+import ReactMarkdown from "react-markdown";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
 
-type Tab = "transcript" | "summary" | "quiz";
+type Tab = "transcript" | "summary" | "chat" | "quiz";
 type ProcessingStatus = "idle" | "processing" | "ready" | "failed";
+type ThemeMode = "light" | "dark";
+type TranscriptSegment = { text?: string; start?: number; duration?: number };
 type ChatMessage = { role: "user" | "ai"; content: string };
+
+function normalizeStudyGuideMarkdown(raw: string): string {
+  if (!raw) {
+    return "";
+  }
+
+  let normalized = raw.replace(/\r\n/g, "\n");
+  normalized = normalized.replace(/\\n/g, "\n");
+
+  // LLMs often escape dollar signs or overproduce delimiters.
+  normalized = normalized.replace(/\\\$/g, "$");
+  normalized = normalized.replace(/\${3,}/g, "$$");
+  normalized = normalized.replace(/\$\$\s*\$+/g, "$$");
+  normalized = normalized.replace(/\$+\s*\$\$/g, "$$");
+
+  // Repair collisions like "\\det$$...$$" and "$$...$$Equation".
+  normalized = normalized.replace(/(\\[a-zA-Z]+)\$\$/g, "$1\n$$");
+  normalized = normalized.replace(/\$\$(\\[a-zA-Z]+)/g, "$$\n$1");
+  normalized = normalized.replace(/\$\$\s*([A-Za-z])/g, "$$\n$1");
+  normalized = normalized.replace(/([A-Za-z0-9\)])\s*\$\$/g, "$1\n$$");
+
+  // Convert LaTeX inline and block delimiters that LLMs often emit.
+  normalized = normalized.replace(/\\\((.*?)\\\)/gs, (_match, expr) => `$${String(expr).trim()}$`);
+  normalized = normalized.replace(/\\\[(.*?)\\\]/gs, (_match, expr) => `$$\n${String(expr).trim()}\n$$`);
+
+  // Convert accidental "$..." block prefixes/suffixes to proper math delimiters.
+  normalized = normalized.replace(/(^|\s)\$([A-Za-z].*?)\$\$/g, (_m, lead, body) => `${lead}$$${String(body).trim()}$$`);
+
+  // Force all display math blocks to be standalone to satisfy remark-math parsing.
+  normalized = normalized.replace(/\$\$([\s\S]*?)\$\$/g, (_m, body) => `\n\n$$\n${String(body).trim()}\n$$\n\n`);
+
+  // Put headings on their own line when models accidentally append them inline.
+  normalized = normalized.replace(/([^\n])\s+(#{1,6}\s+)/g, "$1\n\n$2");
+
+  // Wrap \begin...\end blocks as display math and normalize matrix row breaks.
+  normalized = normalized.replace(
+    /\\begin\{([a-zA-Z*]+)\}([\s\S]*?)\\end\{\1\}/g,
+    (_match, env, body) => {
+      const fixedBody = String(body)
+        .replace(/\\{3,}/g, "\\\\")
+        .replace(/\\\s+/g, "\\\\ ")
+        .replace(/\n{3,}/g, "\n\n");
+      return `$$\n\\begin{${env}}${fixedBody}\\end{${env}}\n$$`;
+    }
+  );
+
+  const maybeInlineMath = (fragment: string): string => {
+    const trimmed = fragment.trim();
+    if (!trimmed || trimmed.includes("$") || /^#{1,6}\s/.test(trimmed)) {
+      return fragment;
+    }
+
+    const withoutBullet = trimmed.replace(/^[-*]\s+/, "");
+    const hasLatexCommand = /\\[a-zA-Z]+/.test(withoutBullet);
+    const hasEquationMarkers = /[=<>+\-*/()\[\]{}]/.test(withoutBullet);
+    const plainWords = withoutBullet
+      .replace(/\\[a-zA-Z]+/g, "")
+      .replace(/[^A-Za-z\s]/g, "")
+      .trim();
+    const hasLongPlainWords = /\b[A-Za-z]{5,}\b/.test(plainWords);
+
+    if (hasLatexCommand && hasEquationMarkers && !hasLongPlainWords) {
+      return `$${withoutBullet}$`;
+    }
+
+    return fragment;
+  };
+
+  // Lift all $$...$$ segments out of sentence lines (including multiple segments per line).
+  normalized = normalized
+    .split("\n")
+    .flatMap((originalLine) => {
+      let line = originalLine;
+      const rebuilt: string[] = [];
+      let guard = 0;
+
+      while (guard < 20) {
+        const start = line.indexOf("$$");
+        if (start === -1) {
+          break;
+        }
+
+        const end = line.indexOf("$$", start + 2);
+        if (end === -1) {
+          break;
+        }
+
+        const before = line.slice(0, start).trimEnd().replace(/:\s*$/, "");
+        const mathBody = line.slice(start + 2, end).trim();
+        const after = line.slice(end + 2).trimStart().replace(/^:\s*/, "");
+
+        if (before) {
+          rebuilt.push(maybeInlineMath(before));
+        }
+
+        rebuilt.push(`$$\n${mathBody}\n$$`);
+        line = after;
+        guard += 1;
+      }
+
+      const rest = line.trim();
+      if (rest) {
+        rebuilt.push(maybeInlineMath(rest));
+      }
+
+      return rebuilt.length > 0 ? rebuilt : [originalLine];
+    })
+    .join("\n");
+
+  // Ensure common transition text after equations starts on a clean line.
+  normalized = normalized.replace(/\$\$\s*(Equation|Therefore|So|Then)\b/g, "$$\n\n$1");
+
+  // Wrap bare equation-like lines that contain LaTeX commands but no delimiters.
+  normalized = normalized
+    .split("\n")
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        return line;
+      }
+
+      const hasMathDelimiter = trimmed.includes("$");
+      const hasLatexCommand = /\\(lambda|mathbf|det|times|begin|end|frac|cdot|alpha|beta|gamma|Sigma|sigma|pmatrix|bmatrix)/.test(trimmed);
+      const looksLikeEquation = /[=<>]/.test(trimmed) || /^\\[a-zA-Z]+/.test(trimmed) || /\([^)]+\)/.test(trimmed);
+
+      if (!hasMathDelimiter && hasLatexCommand && looksLikeEquation) {
+        return `$${trimmed}$`;
+      }
+
+      return line;
+    })
+    .join("\n");
+
+  // Cleanup accidental duplicate math delimiters.
+  normalized = normalized.replace(/\$\$\$+/g, "$$");
+  normalized = normalized.replace(/\$\s+\$/g, "$$");
+
+  return normalized;
+}
+
+function StudyGuideMarkdown({ content }: { content: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkMath]}
+      rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: "ignore", errorColor: "#374151" }]]}
+      components={{
+        h1: ({ children }) => <h1 style={{ fontSize: "1.5rem", fontWeight: 700, margin: "1rem 0 0.5rem" }}>{children}</h1>,
+        h2: ({ children }) => <h2 style={{ fontSize: "1.25rem", fontWeight: 700, margin: "0.9rem 0 0.5rem" }}>{children}</h2>,
+        h3: ({ children }) => <h3 style={{ fontSize: "1.05rem", fontWeight: 600, margin: "0.8rem 0 0.45rem" }}>{children}</h3>,
+        p: ({ children }) => <p style={{ margin: "0.55rem 0", lineHeight: 1.7 }}>{children}</p>,
+        ul: ({ children }) => <ul style={{ margin: "0.5rem 0", paddingLeft: "1.2rem", listStyleType: "disc" }}>{children}</ul>,
+        ol: ({ children }) => <ol style={{ margin: "0.5rem 0", paddingLeft: "1.2rem", listStyleType: "decimal" }}>{children}</ol>,
+        li: ({ children }) => <li style={{ margin: "0.25rem 0" }}>{children}</li>,
+        code: ({ children }) => (
+          <code style={{ backgroundColor: "#f3f4f6", borderRadius: "4px", padding: "0.05rem 0.3rem", fontSize: "0.9em" }}>
+            {children}
+          </code>
+        ),
+      }}
+    >
+      {content}
+    </ReactMarkdown>
+  );
+}
+
+function ChatMarkdown({ content }: { content: string }) {
+  const normalized = normalizeStudyGuideMarkdown(content);
+
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkMath]}
+      rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: "ignore", errorColor: "#374151" }]]}
+      components={{
+        p: ({ children }) => <p style={{ margin: "0.35rem 0", lineHeight: 1.6 }}>{children}</p>,
+        ul: ({ children }) => <ul style={{ margin: "0.35rem 0", paddingLeft: "1.1rem", listStyleType: "disc" }}>{children}</ul>,
+        ol: ({ children }) => <ol style={{ margin: "0.35rem 0", paddingLeft: "1.1rem", listStyleType: "decimal" }}>{children}</ol>,
+        li: ({ children }) => <li style={{ margin: "0.2rem 0" }}>{children}</li>,
+        code: ({ children }) => (
+          <code style={{ backgroundColor: "#f3f4f6", borderRadius: "4px", padding: "0.05rem 0.3rem", fontSize: "0.9em" }}>
+            {children}
+          </code>
+        ),
+      }}
+    >
+      {normalized}
+    </ReactMarkdown>
+  );
+}
 
 function WorkspaceContent() {
   const searchParams = useSearchParams();
@@ -22,6 +215,48 @@ function WorkspaceContent() {
   const [quizData, setQuizData] = useState<any>(null);
   const [quizLoading, setQuizLoading] = useState(false);
   const [quizError, setQuizError] = useState<string | null>(null);
+  const [transcriptSegments, setTranscriptSegments] = useState<TranscriptSegment[]>([]);
+  const [isTranscriptLoading, setIsTranscriptLoading] = useState(false);
+  const [transcriptError, setTranscriptError] = useState<string | null>(null);
+  const [summaryText, setSummaryText] = useState("");
+  const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatQuestion, setChatQuestion] = useState("");
+  const [isChatLoading, setIsChatLoading] = useState(false);
+  const [isDownloadingPdf, setIsDownloadingPdf] = useState(false);
+  const [pdfError, setPdfError] = useState<string | null>(null);
+  const [theme, setTheme] = useState<ThemeMode>("light");
+  const [themeReady, setThemeReady] = useState(false);
+  const pdfContentRef = useRef<HTMLDivElement | null>(null);
+  const hasGeneratedSummary = summaryText.trim().length > 0;
+  const normalizedSummary = normalizeStudyGuideMarkdown(summaryText);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const savedTheme = window.localStorage.getItem("tubeTutorTheme");
+    if (savedTheme === "light" || savedTheme === "dark") {
+      setTheme(savedTheme);
+      setThemeReady(true);
+      return;
+    }
+
+    setTheme(window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    setThemeReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (typeof document === "undefined" || !themeReady) {
+      return;
+    }
+
+    const root = document.documentElement;
+    root.classList.toggle("dark", theme === "dark");
+    window.localStorage.setItem("tubeTutorTheme", theme);
+  }, [theme, themeReady]);
 
   useEffect(() => {
     if (!videoId) return;
@@ -64,7 +299,44 @@ function WorkspaceContent() {
       .finally(() => setIndexing(false));
 
     return () => controller.abort();
-  }, [videoId]);
+  }, [videoId, apiBaseUrl]);
+
+  useEffect(() => {
+    if (!videoId) {
+      setTranscriptSegments([]);
+      setTranscriptError(null);
+      setIsTranscriptLoading(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    setIsTranscriptLoading(true);
+    setTranscriptError(null);
+
+    fetch(`${apiBaseUrl}/transcript?video_id=${encodeURIComponent(videoId)}`, {
+      method: "GET",
+      signal: controller.signal,
+    })
+      .then(async (res) => {
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.error || "Failed to fetch transcript.");
+        }
+
+        const segments = Array.isArray(data.transcript) ? data.transcript : [];
+        setTranscriptSegments(segments);
+      })
+      .catch((err) => {
+        if (err.name !== "AbortError") {
+          const message = err instanceof Error ? err.message : "Failed to fetch transcript.";
+          setTranscriptError(message);
+          setTranscriptSegments([]);
+        }
+      })
+      .finally(() => setIsTranscriptLoading(false));
+
+    return () => controller.abort();
+  }, [videoId, apiBaseUrl]);
 
   // Generate quiz in background after transcript is processed
   useEffect(() => {
@@ -109,25 +381,211 @@ function WorkspaceContent() {
     generateQuiz();
   }, [videoId, processingStatus, apiBaseUrl]);
 
+  useEffect(() => {
+    setSummaryText("");
+    setSummaryError(null);
+    setIsGeneratingSummary(false);
+    setChatMessages([]);
+    setChatQuestion("");
+    setIsChatLoading(false);
+  }, [videoId, apiBaseUrl]);
+
+  const generateSummary = async () => {
+    if (!videoId || isGeneratingSummary) {
+      return;
+    }
+
+    setSummaryError(null);
+    setSummaryText("");
+    setIsGeneratingSummary(true);
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/summary`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ video_id: videoId }),
+      });
+
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to generate study guide.");
+      }
+
+      const summary =
+        typeof data.summary === "string" && data.summary.trim()
+          ? data.summary
+          : "No summary was returned by the server.";
+
+      setSummaryText(summary);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to generate study guide.";
+      setSummaryError(message);
+    } finally {
+      setIsGeneratingSummary(false);
+    }
+  };
+
+  const downloadStudyGuidePdf = async () => {
+    if (isDownloadingPdf || !hasGeneratedSummary) {
+      return;
+    }
+
+    const exportNode = pdfContentRef.current;
+    if (!exportNode) {
+      setPdfError("Could not prepare PDF content. Please try again.");
+      return;
+    }
+
+    setPdfError(null);
+    setIsDownloadingPdf(true);
+
+    let prevLeft = "";
+    let prevTop = "";
+    let prevOpacity = "";
+    let prevZIndex = "";
+    let prevPointerEvents = "";
+
+    try {
+      const { jsPDF } = await import("jspdf");
+      const html2canvasModule = await import("html2canvas");
+      const html2canvas = html2canvasModule.default;
+
+      // Temporarily bring export node into the render area so html2canvas can capture it.
+      prevLeft = exportNode.style.left;
+      prevTop = exportNode.style.top;
+      prevOpacity = exportNode.style.opacity;
+      prevZIndex = exportNode.style.zIndex;
+      prevPointerEvents = exportNode.style.pointerEvents;
+      exportNode.style.left = "0";
+      exportNode.style.top = "0";
+      exportNode.style.opacity = "1";
+      exportNode.style.zIndex = "99999";
+      exportNode.style.pointerEvents = "none";
+
+      const filename = `tube-tutor-study-guide-${videoId || "export"}.pdf`;
+
+      if (typeof document !== "undefined" && "fonts" in document) {
+        await (document as Document & { fonts?: { ready?: Promise<unknown> } }).fonts?.ready;
+      }
+
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+      const pdf = new jsPDF({
+        unit: "pt",
+        format: "letter",
+        orientation: "portrait",
+        compress: true,
+      });
+
+      const canvas = await html2canvas(exportNode, {
+        scale: 2,
+        useCORS: true,
+        backgroundColor: "#ffffff",
+        foreignObjectRendering: true,
+        logging: false,
+      });
+
+      const pageWidthPt = pdf.internal.pageSize.getWidth();
+      const pageHeightPt = pdf.internal.pageSize.getHeight();
+      const marginPt = 36;
+      const contentWidthPt = pageWidthPt - marginPt * 2;
+      const contentHeightPt = pageHeightPt - marginPt * 2;
+
+      const pageCanvasHeightPx = Math.max(
+        1,
+        Math.floor((contentHeightPt * canvas.width) / contentWidthPt)
+      );
+
+      let yOffsetPx = 0;
+      let pageIndex = 0;
+      while (yOffsetPx < canvas.height) {
+        const sliceHeightPx = Math.min(pageCanvasHeightPx, canvas.height - yOffsetPx);
+        const pageCanvas = document.createElement("canvas");
+        pageCanvas.width = canvas.width;
+        pageCanvas.height = sliceHeightPx;
+        const ctx = pageCanvas.getContext("2d");
+        if (!ctx) {
+          throw new Error("Failed to create canvas context for PDF page rendering.");
+        }
+
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, pageCanvas.width, pageCanvas.height);
+        ctx.drawImage(
+          canvas,
+          0,
+          yOffsetPx,
+          canvas.width,
+          sliceHeightPx,
+          0,
+          0,
+          pageCanvas.width,
+          pageCanvas.height
+        );
+
+        const imgData = pageCanvas.toDataURL("image/png");
+        const renderedHeightPt = (sliceHeightPx * contentWidthPt) / canvas.width;
+
+        if (pageIndex > 0) {
+          pdf.addPage();
+        }
+        pdf.addImage(imgData, "PNG", marginPt, marginPt, contentWidthPt, renderedHeightPt);
+
+        yOffsetPx += sliceHeightPx;
+        pageIndex += 1;
+      }
+
+      pdf.save(filename);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to export PDF.";
+      setPdfError(message);
+    } finally {
+      exportNode.style.left = prevLeft;
+      exportNode.style.top = prevTop;
+      exportNode.style.opacity = prevOpacity;
+      exportNode.style.zIndex = prevZIndex;
+      exportNode.style.pointerEvents = prevPointerEvents;
+      setIsDownloadingPdf(false);
+    }
+  };
+
   const tabs: { key: Tab; label: string }[] = [
     { key: "transcript", label: "Transcript" },
-    { key: "summary", label: "Summary" },
+    { key: "summary", label: "Study Guide" },
+    { key: "chat", label: "Chat" },
     { key: "quiz", label: "Quiz" },
   ];
 
   return (
-    <div className="flex flex-col h-screen bg-gray-50">
+    <div className="flex h-screen flex-col bg-slate-50 text-slate-900 transition-colors dark:bg-[#101214] dark:text-slate-100">
       {/* Header */}
-      <header className="flex items-center px-6 py-3 bg-white border-b border-gray-200 shrink-0">
-        <h1 className="text-xl font-semibold text-gray-900">
-          Tube<span className="text-blue-600">Tutor</span>
-        </h1>
+      <header className="shrink-0 border-b border-slate-200 bg-white px-6 py-3 dark:border-slate-700 dark:bg-[#262626]">
+        <div className="flex items-center justify-between gap-4">
+          <Link href="/" className="text-xl font-semibold text-[#262626] transition-opacity hover:opacity-85 dark:text-slate-100">
+            Tube<span className="text-[#b3a369]">Tutor</span>
+          </Link>
+          <button
+            type="button"
+            onClick={() => setTheme((prev) => (prev === "dark" ? "light" : "dark"))}
+            className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-slate-100 px-3 py-1.5 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-200 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700"
+            aria-label="Toggle dark mode"
+            title="Toggle dark mode"
+          >
+            <span
+              className={`inline-block h-2.5 w-2.5 rounded-full ${
+                theme === "dark" ? "bg-[#b3a369]" : "bg-[#262626]"
+              }`}
+            />
+            {theme === "dark" ? "Dark" : "Light"}
+          </button>
+        </div>
       </header>
 
       {/* Main content — stacks vertically on mobile, side-by-side on lg+ */}
       <main className="flex flex-col lg:flex-row flex-1 min-h-0">
         {/* Left pane — Video player */}
-        <section className="w-full lg:w-[60%] bg-black flex items-center justify-center p-4 lg:p-6">
+        <section className="flex w-full items-center justify-center bg-black p-4 lg:w-[60%] lg:p-6">
           <div className="relative w-full" style={{ paddingBottom: "56.25%" }}>
             <iframe
               className="absolute inset-0 w-full h-full rounded-lg"
@@ -141,33 +599,46 @@ function WorkspaceContent() {
         </section>
 
         {/* Right pane — AI Study Hub */}
-        <section className="w-full lg:w-[40%] flex flex-col min-h-0 bg-white border-l border-gray-200">
+        <section className="flex w-full min-h-0 flex-col border-l border-slate-200 bg-white dark:border-slate-700 dark:bg-[#181a1d] lg:w-[40%]">
           {/* Hub header + tabs */}
-          <div className="shrink-0 border-b border-gray-200">
+          <div className="shrink-0 border-b border-slate-200 dark:border-slate-700">
             <div className="px-5 pt-4 pb-2 flex items-center justify-between gap-3">
-              <h2 className="text-sm font-semibold uppercase tracking-wider text-gray-500">
+              <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-300">
                 AI Study Hub
               </h2>
-              <span
-                className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium ${
-                  processingStatus === "processing"
-                    ? "bg-blue-100 text-blue-700"
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={downloadStudyGuidePdf}
+                  disabled={isDownloadingPdf || !hasGeneratedSummary}
+                  className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-600 dark:text-slate-200 dark:hover:bg-slate-700"
+                  title="Download generated study guide as PDF"
+                >
+                  {isDownloadingPdf ? "Preparing PDF..." : "Download as PDF"}
+                </button>
+                <span
+                  className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium ${
+                    processingStatus === "processing"
+                      ? "bg-gtGold/25 text-gtNavy dark:bg-gtGold/20 dark:text-gtGold"
+                      : processingStatus === "ready"
+                        ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300"
+                        : processingStatus === "failed"
+                          ? "bg-red-100 text-red-700 dark:bg-red-500/20 dark:text-red-300"
+                          : "bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-200"
+                  }`}
+                >
+                  {processingStatus === "processing"
+                    ? "Processing"
                     : processingStatus === "ready"
-                      ? "bg-emerald-100 text-emerald-700"
+                      ? "Ready"
                       : processingStatus === "failed"
-                        ? "bg-red-100 text-red-700"
-                        : "bg-gray-100 text-gray-600"
-                }`}
-              >
-                {processingStatus === "processing"
-                  ? "Processing"
-                  : processingStatus === "ready"
-                    ? "Ready"
-                    : processingStatus === "failed"
-                      ? "Failed"
-                      : "Waiting"}
-              </span>
+                        ? "Failed"
+                        : "Waiting"}
+                </span>
+              </div>
             </div>
+            {pdfError && (
+              <p className="px-5 pb-2 text-xs text-red-600">{pdfError}</p>
+            )}
             <nav className="flex px-5 gap-1" aria-label="Study hub tabs">
               {tabs.map((tab) => (
                 <button
@@ -175,8 +646,8 @@ function WorkspaceContent() {
                   onClick={() => setActiveTab(tab.key)}
                   className={`px-4 py-2 text-sm font-medium rounded-t-lg transition-colors ${
                     activeTab === tab.key
-                      ? "bg-blue-50 text-blue-600 border-b-2 border-blue-600"
-                      : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"
+                      ? "border-b-2 border-gtGold bg-gtGold/20 text-gtNavy dark:bg-gtGold/25 dark:text-gtGold"
+                      : "text-slate-500 hover:bg-slate-100 hover:text-slate-700 dark:text-slate-300 dark:hover:bg-slate-700 dark:hover:text-slate-100"
                   }`}
                 >
                   {tab.label}
@@ -193,9 +664,32 @@ function WorkspaceContent() {
                 processingStatus={processingStatus}
                 indexError={indexError}
                 processStats={processStats}
+                transcriptSegments={transcriptSegments}
+                isTranscriptLoading={isTranscriptLoading}
+                transcriptError={transcriptError}
               />
             )}
-            {activeTab === "summary" && <SummaryPanel videoId={videoId} apiBaseUrl={apiBaseUrl} />}
+            {activeTab === "summary" && (
+              <SummaryPanel
+                summaryText={summaryText}
+                isGeneratingSummary={isGeneratingSummary}
+                summaryError={summaryError}
+                onGenerateSummary={generateSummary}
+                disabled={!videoId}
+              />
+            )}
+            {activeTab === "chat" && (
+              <ChatPanel
+                videoId={videoId}
+                apiBaseUrl={apiBaseUrl}
+                messages={chatMessages}
+                setMessages={setChatMessages}
+                question={chatQuestion}
+                setQuestion={setChatQuestion}
+                isLoading={isChatLoading}
+                setIsLoading={setIsChatLoading}
+              />
+            )}
             {activeTab === "quiz" && (
               <QuizPanel
                 videoId={videoId}
@@ -237,6 +731,36 @@ function WorkspaceContent() {
           </div>
         </section>
       </main>
+
+      <div
+        id="pdf-export-root"
+        ref={pdfContentRef}
+        aria-hidden
+        style={{
+          position: "fixed",
+          left: "-99999px",
+          top: 0,
+          width: "850px",
+          padding: "24px",
+          color: "#111827",
+          backgroundColor: "#ffffff",
+          fontFamily: "Arial, Helvetica, sans-serif",
+        }}
+      >
+        <h1 style={{ fontSize: "1.9rem", fontWeight: 700, marginBottom: "0.5rem" }}>Tube-Tutor Study Guide</h1>
+        {videoId && <p style={{ fontSize: "0.85rem", color: "#4b5563", marginBottom: "1.25rem" }}>Video ID: {videoId}</p>}
+
+        <section className="pdf-avoid-break" style={{ marginBottom: "1.5rem", pageBreakInside: "avoid" }}>
+          <h2 style={{ fontSize: "1.35rem", fontWeight: 700, borderBottom: "1px solid #d1d5db", paddingBottom: "0.35rem", marginBottom: "0.75rem" }}>Summary</h2>
+          {hasGeneratedSummary ? (
+            <article style={{ fontSize: "0.98rem", lineHeight: 1.6 }}>
+              <StudyGuideMarkdown content={normalizedSummary} />
+            </article>
+          ) : (
+            <p style={{ color: "#4b5563" }}>No generated summary available yet.</p>
+          )}
+        </section>
+      </div>
     </div>
   );
 }
@@ -258,19 +782,25 @@ function TranscriptPanel({
   processingStatus,
   indexError,
   processStats,
+  transcriptSegments,
+  isTranscriptLoading,
+  transcriptError,
 }: {
   indexing: boolean;
   processingStatus: ProcessingStatus;
   indexError: string | null;
   processStats: { segments: number; chunks: number } | null;
+  transcriptSegments: TranscriptSegment[];
+  isTranscriptLoading: boolean;
+  transcriptError: string | null;
 }) {
   return (
     <div className="space-y-3">
-      <h3 className="text-lg font-semibold text-gray-900">Transcript</h3>
-      <div className="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-3">
+      <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">Transcript</h3>
+      <div className="space-y-3 rounded-lg border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-900/40">
         {processingStatus === "processing" && (
           <>
-            <div className="flex items-center gap-2 text-sm font-medium text-blue-700">
+            <div className="flex items-center gap-2 text-sm font-medium text-gtNavy dark:text-gtGold">
               <svg
                 className="animate-spin h-4 w-4"
                 xmlns="http://www.w3.org/2000/svg"
@@ -282,8 +812,8 @@ function TranscriptPanel({
               </svg>
               <span>Building your study guide...</span>
             </div>
-            <div className="h-2 rounded-full bg-blue-100 overflow-hidden">
-              <div className="h-full w-1/2 bg-blue-500 animate-pulse" />
+            <div className="h-2 overflow-hidden rounded-full bg-gtGold/20 dark:bg-gtGold/10">
+              <div className="h-full w-1/2 animate-pulse bg-gtGold" />
             </div>
           </>
         )}
@@ -299,20 +829,119 @@ function TranscriptPanel({
         )}
 
         {processingStatus === "idle" && !indexing && (
-          <p className="text-sm text-gray-500">
+          <p className="text-sm text-slate-500 dark:text-slate-300">
             The full video transcript will appear here once the video is processed.
           </p>
+        )}
+
+        {isTranscriptLoading && (
+          <p className="text-sm text-slate-600 dark:text-slate-300">Loading transcript...</p>
+        )}
+
+        {!isTranscriptLoading && transcriptError && (
+          <p className="text-sm text-red-600">{transcriptError}</p>
+        )}
+
+        {!isTranscriptLoading && !transcriptError && transcriptSegments.length > 0 && (
+          <div className="max-h-[42vh] space-y-2 overflow-y-auto rounded-md border border-slate-200 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">
+            {transcriptSegments.map((segment, index) => (
+              <p key={`segment-${index}`} className="text-sm leading-6 text-slate-800 dark:text-slate-100">
+                <span className="mr-2 text-xs text-slate-500 dark:text-slate-400">
+                  [{typeof segment.start === "number" ? `${Math.floor(segment.start / 60)}:${String(Math.floor(segment.start % 60)).padStart(2, "0")}` : "--:--"}]
+                </span>
+                {segment.text || ""}
+              </p>
+            ))}
+          </div>
         )}
       </div>
     </div>
   );
 }
 
-function SummaryPanel({ videoId, apiBaseUrl }: { videoId: string; apiBaseUrl: string }) {
+function SummaryPanel({
+  summaryText,
+  isGeneratingSummary,
+  summaryError,
+  onGenerateSummary,
+  disabled,
+}: {
+  summaryText: string;
+  isGeneratingSummary: boolean;
+  summaryError: string | null;
+  onGenerateSummary: () => void;
+  disabled: boolean;
+}) {
+  const hasGeneratedSummary = summaryText.trim().length > 0;
+  const normalizedSummary = normalizeStudyGuideMarkdown(summaryText);
+
   return (
     <div className="space-y-3 h-full min-h-0">
-      <h3 className="text-lg font-semibold text-gray-900">Summary</h3>
-      <ChatAssistant videoId={videoId} apiBaseUrl={apiBaseUrl} />
+      <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">Study Guide</h3>
+
+      <button
+        onClick={onGenerateSummary}
+        disabled={disabled || isGeneratingSummary}
+        className="w-full rounded-lg bg-gtGold px-4 py-2 text-sm font-semibold text-gtNavy transition-colors hover:bg-[#c7b887] disabled:cursor-not-allowed disabled:opacity-50 dark:bg-gtGold dark:text-gtNavy dark:hover:bg-[#c7b887]"
+      >
+        {isGeneratingSummary ? "Generating..." : "Generate Study Guide"}
+      </button>
+
+      {summaryError && (
+        <div className="rounded-lg border border-red-200 bg-red-50 p-3">
+          <p className="text-sm text-red-700">{summaryError}</p>
+        </div>
+      )}
+
+      <div className="max-h-[60vh] overflow-y-auto rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-900">
+        {!summaryText && !isGeneratingSummary && !summaryError && (
+          <p className="text-sm text-slate-500 dark:text-slate-300">
+            Generate a comprehensive study guide from the video transcript.
+          </p>
+        )}
+
+        {hasGeneratedSummary && (
+          <article className="max-w-none text-sm leading-7 text-slate-900 dark:text-slate-100">
+            <StudyGuideMarkdown content={normalizedSummary} />
+          </article>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ChatPanel({
+  videoId,
+  apiBaseUrl,
+  messages,
+  setMessages,
+  question,
+  setQuestion,
+  isLoading,
+  setIsLoading,
+}: {
+  videoId: string;
+  apiBaseUrl: string;
+  messages: ChatMessage[];
+  setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>;
+  question: string;
+  setQuestion: React.Dispatch<React.SetStateAction<string>>;
+  isLoading: boolean;
+  setIsLoading: React.Dispatch<React.SetStateAction<boolean>>;
+}) {
+  return (
+    <div className="space-y-3 h-full min-h-0">
+      <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">Chat</h3>
+      <ChatAssistant
+        videoId={videoId}
+        apiBaseUrl={apiBaseUrl}
+        messages={messages}
+        setMessages={setMessages}
+        question={question}
+        setQuestion={setQuestion}
+        isLoading={isLoading}
+        setIsLoading={setIsLoading}
+      />
     </div>
   );
 }
@@ -335,9 +964,9 @@ function QuizPanel({
   if (quizLoading) {
     return (
       <div className="space-y-3">
-        <h3 className="text-lg font-semibold text-gray-900">Quiz</h3>
-        <div className="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-3">
-          <div className="flex items-center gap-2 text-sm font-medium text-blue-700">
+        <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">Quiz</h3>
+        <div className="space-y-3 rounded-lg border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-900/40">
+          <div className="flex items-center gap-2 text-sm font-medium text-gtNavy dark:text-gtGold">
             <svg
               className="animate-spin h-4 w-4"
               xmlns="http://www.w3.org/2000/svg"
@@ -349,8 +978,8 @@ function QuizPanel({
             </svg>
             <span>Generating your quiz...</span>
           </div>
-          <div className="h-2 rounded-full bg-blue-100 overflow-hidden">
-            <div className="h-full w-1/2 bg-blue-500 animate-pulse" />
+          <div className="h-2 overflow-hidden rounded-full bg-gtGold/20 dark:bg-gtGold/10">
+            <div className="h-full w-1/2 animate-pulse bg-gtGold" />
           </div>
         </div>
       </div>
@@ -360,7 +989,7 @@ function QuizPanel({
   if (quizError) {
     return (
       <div className="space-y-3">
-        <h3 className="text-lg font-semibold text-gray-900">Quiz</h3>
+        <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">Quiz</h3>
         <div className="rounded-lg border border-red-200 bg-red-50 p-4 space-y-3">
           <p className="text-sm text-red-600">{quizError}</p>
           <p className="text-xs text-red-500">
@@ -368,7 +997,7 @@ function QuizPanel({
           </p>
           <button
             onClick={onRegenerate}
-            className="mt-3 w-full rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 transition-colors"
+            className="mt-3 w-full rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-red-700 dark:bg-red-500 dark:hover:bg-red-400"
           >
             Try Again
           </button>
@@ -380,8 +1009,8 @@ function QuizPanel({
   if (!quizData || quizData.length === 0) {
     return (
       <div className="space-y-3">
-        <h3 className="text-lg font-semibold text-gray-900">Quiz</h3>
-        <p className="text-sm text-gray-500">
+        <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">Quiz</h3>
+        <p className="text-sm text-slate-500 dark:text-slate-300">
           AI-generated quiz questions based on the video content will appear here.
         </p>
       </div>
@@ -391,10 +1020,10 @@ function QuizPanel({
   return (
     <div className="space-y-3 h-full flex flex-col -m-5">
       <div className="flex items-center justify-between gap-3 px-5 pt-3">
-        <h3 className="text-lg font-semibold text-gray-900">Quiz</h3>
+        <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">Quiz</h3>
         <button
           onClick={onRegenerate}
-          className="text-xs font-medium text-blue-600 hover:text-blue-700 px-3 py-1 rounded-full hover:bg-blue-50 transition-colors"
+          className="rounded-full px-3 py-1 text-xs font-semibold text-gtNavy transition-colors hover:bg-gtGold/20 dark:text-gtGold dark:hover:bg-gtGold/10"
           title="Generate a new quiz"
         >
           🔄 New Quiz
@@ -407,10 +1036,25 @@ function QuizPanel({
   );
 }
 
-function ChatAssistant({ videoId, apiBaseUrl }: { videoId: string; apiBaseUrl: string }) {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [question, setQuestion] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
+function ChatAssistant({
+  videoId,
+  apiBaseUrl,
+  messages,
+  setMessages,
+  question,
+  setQuestion,
+  isLoading,
+  setIsLoading,
+}: {
+  videoId: string;
+  apiBaseUrl: string;
+  messages: ChatMessage[];
+  setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>;
+  question: string;
+  setQuestion: React.Dispatch<React.SetStateAction<string>>;
+  isLoading: boolean;
+  setIsLoading: React.Dispatch<React.SetStateAction<boolean>>;
+}) {
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -469,29 +1113,33 @@ function ChatAssistant({ videoId, apiBaseUrl }: { videoId: string; apiBaseUrl: s
   };
 
   return (
-    <div className="h-full min-h-0 rounded-xl border border-gray-200 bg-white shadow-sm flex flex-col overflow-hidden">
-      <div className="flex-1 min-h-0 overflow-y-auto px-4 py-4 space-y-3 bg-gray-50">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-900">
+      <div className="flex-1 min-h-0 space-y-3 overflow-y-auto bg-slate-50 px-4 py-4 dark:bg-[#101214]">
         {messages.length === 0 && (
-          <p className="text-sm text-gray-500">
-            Ask any question about this video. Your chat history will appear here.
+          <p className="text-sm text-slate-500 dark:text-slate-300">
+            Ask questions about this video and chat with the assistant.
           </p>
         )}
 
         {messages.map((message, index) => (
           <div
             key={`${message.role}-${index}`}
-            className={`max-w-[90%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap ${
+            className={`max-w-[90%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
               message.role === "user"
-                ? "ml-auto bg-blue-600 text-white"
-                : "mr-auto bg-white text-gray-800 border border-gray-200"
+                ? "ml-auto whitespace-pre-wrap bg-gtNavy text-slate-100 dark:bg-gtGold dark:text-gtNavy"
+                : "mr-auto border border-slate-200 bg-white text-slate-800 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
             }`}
           >
-            {message.content}
+            {message.role === "ai" ? (
+              <ChatMarkdown content={message.content} />
+            ) : (
+              message.content
+            )}
           </div>
         ))}
 
         {isLoading && (
-          <div className="mr-auto bg-white text-gray-700 border border-gray-200 rounded-2xl px-4 py-2.5 text-sm">
+          <div className="mr-auto rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-700 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100">
             Thinking...
           </div>
         )}
@@ -499,20 +1147,20 @@ function ChatAssistant({ videoId, apiBaseUrl }: { videoId: string; apiBaseUrl: s
         <div ref={bottomRef} />
       </div>
 
-      <form onSubmit={onSubmit} className="shrink-0 border-t border-gray-200 bg-white p-3 sticky bottom-0">
+      <form onSubmit={onSubmit} className="shrink-0 border-t border-slate-200 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">
         <div className="flex items-center gap-2">
           <input
             type="text"
             value={question}
             onChange={(event) => setQuestion(event.target.value)}
             placeholder="Ask about this video..."
-            className="flex-1 rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-gtGold dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-400"
             disabled={isLoading}
           />
           <button
             type="submit"
             disabled={isLoading || !question.trim()}
-            className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50 disabled:cursor-not-allowed hover:bg-blue-700 transition-colors"
+            className="rounded-lg bg-gtGold px-4 py-2 text-sm font-semibold text-gtNavy transition-colors hover:bg-[#c7b887] disabled:cursor-not-allowed disabled:opacity-50"
           >
             {isLoading ? "Sending..." : "Send"}
           </button>
@@ -521,3 +1169,4 @@ function ChatAssistant({ videoId, apiBaseUrl }: { videoId: string; apiBaseUrl: s
     </div>
   );
 }
+

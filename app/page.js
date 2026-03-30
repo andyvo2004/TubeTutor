@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
 function extractVideoId(input) {
@@ -25,8 +25,36 @@ export default function Home() {
   const [url, setUrl] = useState("");
   const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [theme, setTheme] = useState("light");
+  const [themeReady, setThemeReady] = useState(false);
   const router = useRouter();
   const apiBaseUrl = process.env.NEXT_PUBLIC_FLASK_API_URL ?? "http://127.0.0.1:5000";
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const savedTheme = window.localStorage.getItem("tubeTutorTheme");
+    if (savedTheme === "light" || savedTheme === "dark") {
+      setTheme(savedTheme);
+      setThemeReady(true);
+      return;
+    }
+
+    setTheme(window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    setThemeReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (typeof document === "undefined" || !themeReady) {
+      return;
+    }
+
+    const root = document.documentElement;
+    root.classList.toggle("dark", theme === "dark");
+    window.localStorage.setItem("tubeTutorTheme", theme);
+  }, [theme, themeReady]);
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -63,7 +91,17 @@ export default function Home() {
   }
 
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center bg-zinc-50 px-4 dark:bg-black">
+    <div className="relative flex min-h-screen flex-col items-center justify-center bg-zinc-50 px-4 dark:bg-black">
+      <button
+        type="button"
+        onClick={() => setTheme((prev) => (prev === "dark" ? "light" : "dark"))}
+        className="absolute right-4 top-4 inline-flex items-center gap-2 rounded-full border border-zinc-300 bg-zinc-100 px-3 py-1.5 text-xs font-semibold text-zinc-700 transition-colors hover:bg-zinc-200 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700 sm:right-6 sm:top-6"
+        aria-label="Toggle dark mode"
+        title="Toggle dark mode"
+      >
+        <span className={`inline-block h-2.5 w-2.5 rounded-full ${theme === "dark" ? "bg-[#b3a369]" : "bg-[#262626]"}`} />
+        {theme === "dark" ? "Dark" : "Light"}
+      </button>
       <h1 className="mb-2 text-5xl font-bold tracking-tight text-zinc-900 dark:text-zinc-50">
         TubeTutor
       </h1>

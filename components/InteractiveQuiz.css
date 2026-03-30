@@ -148,6 +148,27 @@
   background-color: #fef2f2;
 }
 
+.answer-explanation {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: left;
+}
+
+.correct-explanation {
+  color: #166534;
+  background-color: #ecfdf3;
+  border: 1px solid #bbf7d0;
+}
+
+.incorrect-explanation {
+  color: #9f1239;
+  background-color: #fff1f2;
+  border: 1px solid #fecdd3;
+}
+
 .nav-button {
   width: 100%;
   padding: 12px 16px;

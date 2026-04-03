@@ -68,17 +68,6 @@ export default function Home() {
         return;
       }
 
-      // Preflight the backend so we fail fast on the homepage if API/transcript is unavailable.
-      const response = await fetch(
-        `${apiBaseUrl}/transcript?video_id=${encodeURIComponent(videoId)}`
-      );
-      const payload = await response.json();
-
-      if (!response.ok) {
-        setStatus({ error: payload.error ?? "Failed to validate transcript." });
-        return;
-      }
-
       router.push(`/workspace?v=${encodeURIComponent(videoId)}`);
     } catch {
       setStatus({

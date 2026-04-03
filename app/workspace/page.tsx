@@ -5,6 +5,8 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import InteractiveQuiz from "@/components/InteractiveQuiz";
 import ReactMarkdown from "react-markdown";
+import rehypeRaw from "rehype-raw";
+import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 
@@ -19,161 +21,244 @@ function normalizeStudyGuideMarkdown(raw: string): string {
     return "";
   }
 
-  let normalized = raw.replace(/\r\n/g, "\n");
-  normalized = normalized.replace(/\\n/g, "\n");
+  return raw
+    .replace(/\r\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/&lt;br\s*\/?&gt;/gi, "<br />")
+    .replace(/<br\s*\/?\s*>/gi, "<br />");
+}
 
-  // LLMs often escape dollar signs or overproduce delimiters.
-  normalized = normalized.replace(/\\\$/g, "$");
-  normalized = normalized.replace(/\${3,}/g, "$$");
-  normalized = normalized.replace(/\$\$\s*\$+/g, "$$");
-  normalized = normalized.replace(/\$+\s*\$\$/g, "$$");
+const markdownDisallowedElements = [
+  "script",
+  "style",
+  "iframe",
+  "object",
+  "embed",
+  "form",
+  "input",
+  "button",
+  "textarea",
+  "select",
+  "option",
+  "meta",
+  "link",
+];
 
-  // Repair collisions like "\\det$$...$$" and "$$...$$Equation".
-  normalized = normalized.replace(/(\\[a-zA-Z]+)\$\$/g, "$1\n$$");
-  normalized = normalized.replace(/\$\$(\\[a-zA-Z]+)/g, "$$\n$1");
-  normalized = normalized.replace(/\$\$\s*([A-Za-z])/g, "$$\n$1");
-  normalized = normalized.replace(/([A-Za-z0-9\)])\s*\$\$/g, "$1\n$$");
+function formatPdfExportTimestamp(date: Date): string {
+  return date.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
 
-  // Convert LaTeX inline and block delimiters that LLMs often emit.
-  normalized = normalized.replace(/\\\((.*?)\\\)/gs, (_match, expr) => `$${String(expr).trim()}$`);
-  normalized = normalized.replace(/\\\[(.*?)\\\]/gs, (_match, expr) => `$$\n${String(expr).trim()}\n$$`);
+function collectPdfBreakpoints(exportNode: HTMLElement, canvasHeightPx: number): number[] {
+  const blockNodes = Array.from(exportNode.querySelectorAll<HTMLElement>("[data-pdf-block='true']"));
+  const rowNodes = Array.from(exportNode.querySelectorAll<HTMLElement>("[data-pdf-row='true']"));
+  if (blockNodes.length === 0) {
+    return [];
+  }
 
-  // Convert accidental "$..." block prefixes/suffixes to proper math delimiters.
-  normalized = normalized.replace(/(^|\s)\$([A-Za-z].*?)\$\$/g, (_m, lead, body) => `${lead}$$${String(body).trim()}$$`);
+  const domHeight = Math.max(1, exportNode.scrollHeight);
+  const pxScale = canvasHeightPx / domHeight;
+  const rootRect = exportNode.getBoundingClientRect();
+  const points = new Set<number>();
 
-  // Force all display math blocks to be standalone to satisfy remark-math parsing.
-  normalized = normalized.replace(/\$\$([\s\S]*?)\$\$/g, (_m, body) => `\n\n$$\n${String(body).trim()}\n$$\n\n`);
-
-  // Put headings on their own line when models accidentally append them inline.
-  normalized = normalized.replace(/([^\n])\s+(#{1,6}\s+)/g, "$1\n\n$2");
-
-  // Wrap \begin...\end blocks as display math and normalize matrix row breaks.
-  normalized = normalized.replace(
-    /\\begin\{([a-zA-Z*]+)\}([\s\S]*?)\\end\{\1\}/g,
-    (_match, env, body) => {
-      const fixedBody = String(body)
-        .replace(/\\{3,}/g, "\\\\")
-        .replace(/\\\s+/g, "\\\\ ")
-        .replace(/\n{3,}/g, "\n\n");
-      return `$$\n\\begin{${env}}${fixedBody}\\end{${env}}\n$$`;
+  const addPoint = (rawPoint: number) => {
+    const clamped = Math.max(1, Math.min(canvasHeightPx - 1, rawPoint));
+    if (Number.isFinite(clamped)) {
+      points.add(clamped);
     }
-  );
-
-  const maybeInlineMath = (fragment: string): string => {
-    const trimmed = fragment.trim();
-    if (!trimmed || trimmed.includes("$") || /^#{1,6}\s/.test(trimmed)) {
-      return fragment;
-    }
-
-    const withoutBullet = trimmed.replace(/^[-*]\s+/, "");
-    const hasLatexCommand = /\\[a-zA-Z]+/.test(withoutBullet);
-    const hasEquationMarkers = /[=<>+\-*/()\[\]{}]/.test(withoutBullet);
-    const plainWords = withoutBullet
-      .replace(/\\[a-zA-Z]+/g, "")
-      .replace(/[^A-Za-z\s]/g, "")
-      .trim();
-    const hasLongPlainWords = /\b[A-Za-z]{5,}\b/.test(plainWords);
-
-    if (hasLatexCommand && hasEquationMarkers && !hasLongPlainWords) {
-      return `$${withoutBullet}$`;
-    }
-
-    return fragment;
   };
 
-  // Lift all $$...$$ segments out of sentence lines (including multiple segments per line).
-  normalized = normalized
-    .split("\n")
-    .flatMap((originalLine) => {
-      let line = originalLine;
-      const rebuilt: string[] = [];
-      let guard = 0;
+  for (const node of blockNodes) {
+    const rect = node.getBoundingClientRect();
+    const topDomPx = Math.max(0, rect.top - rootRect.top);
+    const bottomDomPx = Math.max(0, rect.bottom - rootRect.top);
+    const top = Math.floor(topDomPx * pxScale);
+    const bottom = Math.floor(bottomDomPx * pxScale);
 
-      while (guard < 20) {
-        const start = line.indexOf("$$");
-        if (start === -1) {
-          break;
-        }
+    if (top > 0) {
+      addPoint(top);
+    }
+    if (bottom > 0) {
+      addPoint(bottom);
+    }
+  }
 
-        const end = line.indexOf("$$", start + 2);
-        if (end === -1) {
-          break;
-        }
+  for (const row of rowNodes) {
+    const rect = row.getBoundingClientRect();
+    const rowTopDomPx = Math.max(0, rect.top - rootRect.top);
+    const rowBottomDomPx = Math.max(0, rect.bottom - rootRect.top);
+    const rowTop = Math.floor(rowTopDomPx * pxScale);
+    const rowBottom = Math.floor(rowBottomDomPx * pxScale);
 
-        const before = line.slice(0, start).trimEnd().replace(/:\s*$/, "");
-        const mathBody = line.slice(start + 2, end).trim();
-        const after = line.slice(end + 2).trimStart().replace(/^:\s*/, "");
+    if (rowTop > 0) {
+      addPoint(rowTop);
+      addPoint(rowTop - 2);
+    }
+    if (rowBottom > 0) {
+      addPoint(rowBottom);
+    }
+  }
 
-        if (before) {
-          rebuilt.push(maybeInlineMath(before));
-        }
+  return Array.from(points).sort((a, b) => a - b);
+}
 
-        rebuilt.push(`$$\n${mathBody}\n$$`);
-        line = after;
-        guard += 1;
-      }
+function chooseNextSliceHeight(
+  yOffsetPx: number,
+  pageCanvasHeightPx: number,
+  canvasHeightPx: number,
+  breakpointsPx: number[]
+): number {
+  const remaining = canvasHeightPx - yOffsetPx;
+  if (remaining <= pageCanvasHeightPx) {
+    return remaining;
+  }
 
-      const rest = line.trim();
-      if (rest) {
-        rebuilt.push(maybeInlineMath(rest));
-      }
+  const target = yOffsetPx + pageCanvasHeightPx;
+  const minSliceHeight = Math.max(120, Math.floor(pageCanvasHeightPx * 0.45));
+  const maxStretchHeight = Math.floor(pageCanvasHeightPx * 1.2);
 
-      return rebuilt.length > 0 ? rebuilt : [originalLine];
-    })
-    .join("\n");
+  let previousBreakpoint = -1;
+  let nextBreakpoint = -1;
 
-  // Ensure common transition text after equations starts on a clean line.
-  normalized = normalized.replace(/\$\$\s*(Equation|Therefore|So|Then)\b/g, "$$\n\n$1");
+  for (const breakpoint of breakpointsPx) {
+    if (breakpoint <= yOffsetPx + minSliceHeight) {
+      continue;
+    }
+    if (breakpoint <= target) {
+      previousBreakpoint = breakpoint;
+      continue;
+    }
+    nextBreakpoint = breakpoint;
+    break;
+  }
 
-  // Wrap bare equation-like lines that contain LaTeX commands but no delimiters.
-  normalized = normalized
-    .split("\n")
-    .map((line) => {
-      const trimmed = line.trim();
-      if (!trimmed) {
-        return line;
-      }
+  if (previousBreakpoint > 0) {
+    const candidate = previousBreakpoint - yOffsetPx;
+    if (candidate >= minSliceHeight) {
+      return candidate;
+    }
+  }
 
-      const hasMathDelimiter = trimmed.includes("$");
-      const hasLatexCommand = /\\(lambda|mathbf|det|times|begin|end|frac|cdot|alpha|beta|gamma|Sigma|sigma|pmatrix|bmatrix)/.test(trimmed);
-      const looksLikeEquation = /[=<>]/.test(trimmed) || /^\\[a-zA-Z]+/.test(trimmed) || /\([^)]+\)/.test(trimmed);
+  if (nextBreakpoint > 0) {
+    const stretched = nextBreakpoint - yOffsetPx;
+    if (stretched > minSliceHeight && stretched <= maxStretchHeight) {
+      return stretched;
+    }
+  }
 
-      if (!hasMathDelimiter && hasLatexCommand && looksLikeEquation) {
-        return `$${trimmed}$`;
-      }
-
-      return line;
-    })
-    .join("\n");
-
-  // Cleanup accidental duplicate math delimiters.
-  normalized = normalized.replace(/\$\$\$+/g, "$$");
-  normalized = normalized.replace(/\$\s+\$/g, "$$");
-
-  return normalized;
+  return pageCanvasHeightPx;
 }
 
 function StudyGuideMarkdown({ content }: { content: string }) {
+  const normalizedContent = normalizeStudyGuideMarkdown(content);
+
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkMath]}
-      rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: "ignore", errorColor: "#374151" }]]}
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[rehypeRaw, [rehypeKatex, { throwOnError: false, strict: "ignore", errorColor: "#374151" }]]}
+      disallowedElements={markdownDisallowedElements}
+      unwrapDisallowed
       components={{
-        h1: ({ children }) => <h1 style={{ fontSize: "1.5rem", fontWeight: 700, margin: "1rem 0 0.5rem" }}>{children}</h1>,
-        h2: ({ children }) => <h2 style={{ fontSize: "1.25rem", fontWeight: 700, margin: "0.9rem 0 0.5rem" }}>{children}</h2>,
-        h3: ({ children }) => <h3 style={{ fontSize: "1.05rem", fontWeight: 600, margin: "0.8rem 0 0.45rem" }}>{children}</h3>,
-        p: ({ children }) => <p style={{ margin: "0.55rem 0", lineHeight: 1.7 }}>{children}</p>,
-        ul: ({ children }) => <ul style={{ margin: "0.5rem 0", paddingLeft: "1.2rem", listStyleType: "disc" }}>{children}</ul>,
-        ol: ({ children }) => <ol style={{ margin: "0.5rem 0", paddingLeft: "1.2rem", listStyleType: "decimal" }}>{children}</ol>,
+        h1: ({ children }) => (
+          <h1
+            data-pdf-block="true"
+            style={{ fontSize: "1.55rem", fontWeight: 700, lineHeight: 1.3, margin: "1.2rem 0 0.6rem", color: "#0f172a" }}
+          >
+            {children}
+          </h1>
+        ),
+        h2: ({ children }) => (
+          <h2
+            data-pdf-block="true"
+            style={{ fontSize: "1.28rem", fontWeight: 700, lineHeight: 1.35, margin: "1rem 0 0.55rem", color: "#111827" }}
+          >
+            {children}
+          </h2>
+        ),
+        h3: ({ children }) => (
+          <h3
+            data-pdf-block="true"
+            style={{ fontSize: "1.08rem", fontWeight: 700, lineHeight: 1.4, margin: "0.85rem 0 0.45rem", color: "#1f2937" }}
+          >
+            {children}
+          </h3>
+        ),
+        p: ({ children }) => (
+          <p data-pdf-block="true" style={{ margin: "0.62rem 0", lineHeight: 1.75, color: "#111827" }}>
+            {children}
+          </p>
+        ),
+        ul: ({ children }) => (
+          <ul
+            data-pdf-block="true"
+            style={{ margin: "0.56rem 0", paddingLeft: "1.25rem", listStyleType: "disc", lineHeight: 1.7 }}
+          >
+            {children}
+          </ul>
+        ),
+        ol: ({ children }) => (
+          <ol
+            data-pdf-block="true"
+            style={{ margin: "0.56rem 0", paddingLeft: "1.25rem", listStyleType: "decimal", lineHeight: 1.7 }}
+          >
+            {children}
+          </ol>
+        ),
         li: ({ children }) => <li style={{ margin: "0.25rem 0" }}>{children}</li>,
-        code: ({ children }) => (
-          <code style={{ backgroundColor: "#f3f4f6", borderRadius: "4px", padding: "0.05rem 0.3rem", fontSize: "0.9em" }}>
+        pre: ({ children }) => (
+          <pre
+            data-pdf-block="true"
+            style={{
+              backgroundColor: "#f8fafc",
+              border: "1px solid #e2e8f0",
+              borderRadius: "6px",
+              padding: "0.7rem 0.8rem",
+              overflowX: "auto",
+              margin: "0.7rem 0",
+            }}
+          >
+            {children}
+          </pre>
+        ),
+        table: ({ children }) => (
+          <div data-pdf-block="true" style={{ overflowX: "auto", margin: "0.75rem 0" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: "420px", tableLayout: "fixed" }}>{children}</table>
+          </div>
+        ),
+        thead: ({ children }) => <thead style={{ backgroundColor: "#f1f5f9" }}>{children}</thead>,
+        tr: ({ children }) => <tr data-pdf-row="true">{children}</tr>,
+        th: ({ children }) => (
+          <th style={{ border: "1px solid #d1d5db", padding: "0.55rem 0.65rem", textAlign: "left", fontWeight: 700, wordBreak: "break-word", overflowWrap: "anywhere" }}>
+            {children}
+          </th>
+        ),
+        td: ({ children }) => (
+          <td style={{ border: "1px solid #d1d5db", padding: "0.48rem 0.65rem", verticalAlign: "top", wordBreak: "break-word", overflowWrap: "anywhere" }}>
+            {children}
+          </td>
+        ),
+        code: ({ children, className }) => (
+          <code
+            className={className}
+            style={{
+              backgroundColor: "#f3f4f6",
+              borderRadius: "4px",
+              padding: "0.08rem 0.32rem",
+              fontSize: "0.9em",
+              fontFamily: '"Cascadia Code", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
+            }}
+          >
             {children}
           </code>
         ),
       }}
     >
-      {content}
+      {normalizedContent}
     </ReactMarkdown>
   );
 }
@@ -183,13 +268,27 @@ function ChatMarkdown({ content }: { content: string }) {
 
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkMath]}
-      rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: "ignore", errorColor: "#374151" }]]}
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[rehypeRaw, [rehypeKatex, { throwOnError: false, strict: "ignore", errorColor: "#374151" }]]}
+      disallowedElements={markdownDisallowedElements}
+      unwrapDisallowed
       components={{
         p: ({ children }) => <p style={{ margin: "0.35rem 0", lineHeight: 1.6 }}>{children}</p>,
         ul: ({ children }) => <ul style={{ margin: "0.35rem 0", paddingLeft: "1.1rem", listStyleType: "disc" }}>{children}</ul>,
         ol: ({ children }) => <ol style={{ margin: "0.35rem 0", paddingLeft: "1.1rem", listStyleType: "decimal" }}>{children}</ol>,
         li: ({ children }) => <li style={{ margin: "0.2rem 0" }}>{children}</li>,
+        table: ({ children }) => (
+          <div style={{ overflowX: "auto", margin: "0.55rem 0" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: "360px" }}>{children}</table>
+          </div>
+        ),
+        thead: ({ children }) => <thead style={{ backgroundColor: "#f8fafc" }}>{children}</thead>,
+        th: ({ children }) => (
+          <th style={{ border: "1px solid #d1d5db", padding: "0.4rem 0.5rem", textAlign: "left", fontWeight: 700 }}>
+            {children}
+          </th>
+        ),
+        td: ({ children }) => <td style={{ border: "1px solid #d1d5db", padding: "0.35rem 0.5rem", verticalAlign: "top" }}>{children}</td>,
         code: ({ children }) => (
           <code style={{ backgroundColor: "#f3f4f6", borderRadius: "4px", padding: "0.05rem 0.3rem", fontSize: "0.9em" }}>
             {children}
@@ -231,6 +330,7 @@ function WorkspaceContent() {
   const pdfContentRef = useRef<HTMLDivElement | null>(null);
   const hasGeneratedSummary = summaryText.trim().length > 0;
   const normalizedSummary = normalizeStudyGuideMarkdown(summaryText);
+  const pdfPreviewTimestamp = formatPdfExportTimestamp(new Date());
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -320,7 +420,9 @@ function WorkspaceContent() {
       .then(async (res) => {
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          throw new Error(data.error || "Failed to fetch transcript.");
+          const baseMessage = data.error || "Failed to fetch transcript.";
+          const details = typeof data.details === "string" && data.details.trim() ? ` ${data.details}` : "";
+          throw new Error(`${baseMessage}${details}`.trim());
         }
 
         const segments = Array.isArray(data.transcript) ? data.transcript : [];
@@ -409,7 +511,9 @@ function WorkspaceContent() {
 
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(data.error || "Failed to generate study guide.");
+        const baseMessage = data.error || "Failed to generate study guide.";
+        const details = typeof data.details === "string" && data.details.trim() ? ` ${data.details}` : "";
+        throw new Error(`${baseMessage}${details}`.trim());
       }
 
       const summary =
@@ -472,6 +576,10 @@ function WorkspaceContent() {
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 
+      const exportedAt = formatPdfExportTimestamp(new Date());
+      const guideTitle = "TubeTutor Study Guide";
+      const guideSubtitle = videoId ? `Video ID: ${videoId}` : "Generated Study Guide";
+
       const pdf = new jsPDF({
         unit: "pt",
         format: "letter",
@@ -480,7 +588,7 @@ function WorkspaceContent() {
       });
 
       const canvas = await html2canvas(exportNode, {
-        scale: 2,
+        scale: 3,
         useCORS: true,
         backgroundColor: "#ffffff",
         foreignObjectRendering: true,
@@ -489,19 +597,30 @@ function WorkspaceContent() {
 
       const pageWidthPt = pdf.internal.pageSize.getWidth();
       const pageHeightPt = pdf.internal.pageSize.getHeight();
-      const marginPt = 36;
-      const contentWidthPt = pageWidthPt - marginPt * 2;
-      const contentHeightPt = pageHeightPt - marginPt * 2;
+      const horizontalMarginPt = 48;
+      const headerBandPt = 44;
+      const footerBandPt = 28;
+      const topMarginPt = 24;
+      const bottomMarginPt = 20;
+      const contentXPt = horizontalMarginPt;
+      const contentYPt = topMarginPt + headerBandPt;
+      const contentWidthPt = pageWidthPt - horizontalMarginPt * 2;
+      const contentHeightPt = pageHeightPt - contentYPt - (bottomMarginPt + footerBandPt);
 
       const pageCanvasHeightPx = Math.max(
         1,
         Math.floor((contentHeightPt * canvas.width) / contentWidthPt)
       );
+      const breakpointsPx = collectPdfBreakpoints(exportNode, canvas.height);
+      const seamOverlapPx = 2;
 
       let yOffsetPx = 0;
       let pageIndex = 0;
       while (yOffsetPx < canvas.height) {
-        const sliceHeightPx = Math.min(pageCanvasHeightPx, canvas.height - yOffsetPx);
+        const sliceHeightPx = Math.max(
+          1,
+          chooseNextSliceHeight(yOffsetPx, pageCanvasHeightPx, canvas.height, breakpointsPx)
+        );
         const pageCanvas = document.createElement("canvas");
         pageCanvas.width = canvas.width;
         pageCanvas.height = sliceHeightPx;
@@ -530,10 +649,46 @@ function WorkspaceContent() {
         if (pageIndex > 0) {
           pdf.addPage();
         }
-        pdf.addImage(imgData, "PNG", marginPt, marginPt, contentWidthPt, renderedHeightPt);
+        pdf.addImage(imgData, "PNG", contentXPt, contentYPt, contentWidthPt, renderedHeightPt);
 
-        yOffsetPx += sliceHeightPx;
+        const hasMoreContent = yOffsetPx + sliceHeightPx < canvas.height;
+        const advancePx = hasMoreContent ? Math.max(1, sliceHeightPx - seamOverlapPx) : sliceHeightPx;
+        yOffsetPx += advancePx;
         pageIndex += 1;
+      }
+
+      const totalPages = pdf.getNumberOfPages();
+      for (let page = 1; page <= totalPages; page += 1) {
+        pdf.setPage(page);
+
+        pdf.setDrawColor(203, 213, 225);
+        pdf.setLineWidth(0.8);
+        pdf.line(horizontalMarginPt, topMarginPt + headerBandPt - 8, pageWidthPt - horizontalMarginPt, topMarginPt + headerBandPt - 8);
+
+        pdf.setFont("helvetica", "bold");
+        pdf.setTextColor(15, 23, 42);
+        pdf.setFontSize(11.5);
+        pdf.text(guideTitle, horizontalMarginPt, topMarginPt + 8);
+
+        pdf.setFont("helvetica", "normal");
+        pdf.setTextColor(75, 85, 99);
+        pdf.setFontSize(9.5);
+        pdf.text(guideSubtitle, horizontalMarginPt, topMarginPt + 22);
+
+        const timestampWidth = pdf.getTextWidth(exportedAt);
+        pdf.text(exportedAt, pageWidthPt - horizontalMarginPt - timestampWidth, topMarginPt + 22);
+
+        const footerLineY = pageHeightPt - bottomMarginPt - footerBandPt + 3;
+        pdf.setDrawColor(203, 213, 225);
+        pdf.setLineWidth(0.8);
+        pdf.line(horizontalMarginPt, footerLineY, pageWidthPt - horizontalMarginPt, footerLineY);
+
+        pdf.setFont("helvetica", "normal");
+        pdf.setTextColor(100, 116, 139);
+        pdf.setFontSize(9);
+        const pageText = `Page ${page} of ${totalPages}`;
+        const pageTextWidth = pdf.getTextWidth(pageText);
+        pdf.text(pageText, pageWidthPt - horizontalMarginPt - pageTextWidth, pageHeightPt - bottomMarginPt);
       }
 
       pdf.save(filename);
@@ -740,24 +895,49 @@ function WorkspaceContent() {
           position: "fixed",
           left: "-99999px",
           top: 0,
-          width: "850px",
-          padding: "24px",
+          width: "880px",
+          padding: "36px 38px",
           color: "#111827",
           backgroundColor: "#ffffff",
-          fontFamily: "Arial, Helvetica, sans-serif",
+          fontFamily: '"Source Serif 4", Georgia, "Times New Roman", serif',
+          fontSize: "1rem",
         }}
       >
-        <h1 style={{ fontSize: "1.9rem", fontWeight: 700, marginBottom: "0.5rem" }}>Tube-Tutor Study Guide</h1>
-        {videoId && <p style={{ fontSize: "0.85rem", color: "#4b5563", marginBottom: "1.25rem" }}>Video ID: {videoId}</p>}
+        <header
+          data-pdf-block="true"
+          style={{ borderBottom: "2px solid #cbd5e1", paddingBottom: "0.8rem", marginBottom: "1rem" }}
+        >
+          <h1 style={{ fontSize: "2rem", fontWeight: 700, marginBottom: "0.35rem", color: "#0f172a", lineHeight: 1.2 }}>
+            TubeTutor Study Guide
+          </h1>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: "1rem", color: "#475569", fontSize: "0.88rem" }}>
+            <span>{videoId ? `Video ID: ${videoId}` : "Video ID unavailable"}</span>
+            <span>Generated: {pdfPreviewTimestamp}</span>
+          </div>
+        </header>
 
         <section className="pdf-avoid-break" style={{ marginBottom: "1.5rem", pageBreakInside: "avoid" }}>
-          <h2 style={{ fontSize: "1.35rem", fontWeight: 700, borderBottom: "1px solid #d1d5db", paddingBottom: "0.35rem", marginBottom: "0.75rem" }}>Summary</h2>
+          <h2
+            data-pdf-block="true"
+            style={{
+              fontSize: "1.35rem",
+              fontWeight: 700,
+              borderBottom: "1px solid #cbd5e1",
+              paddingBottom: "0.35rem",
+              marginBottom: "0.8rem",
+              color: "#0f172a",
+            }}
+          >
+            Summary
+          </h2>
           {hasGeneratedSummary ? (
-            <article style={{ fontSize: "0.98rem", lineHeight: 1.6 }}>
+            <article data-pdf-block="true" style={{ fontSize: "1rem", lineHeight: 1.72 }}>
               <StudyGuideMarkdown content={normalizedSummary} />
             </article>
           ) : (
-            <p style={{ color: "#4b5563" }}>No generated summary available yet.</p>
+            <p data-pdf-block="true" style={{ color: "#4b5563" }}>
+              No generated summary available yet.
+            </p>
           )}
         </section>
       </div>

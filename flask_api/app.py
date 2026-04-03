@@ -15,7 +15,13 @@ from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     VideoUnavailable,
 )
-from rag_engine import ask_video_question, search_transcript_chunks, store_transcript_segments
+from rag_engine import (
+    ask_video_question,
+    generate_map_reduce_summary,
+    get_stored_transcript_chunks,
+    search_transcript_chunks,
+    store_transcript_segments,
+)
 
 app = Flask(__name__)
 ytt_api = YouTubeTranscriptApi()
@@ -25,8 +31,56 @@ def _sanitize_study_guide_markdown(raw: str) -> str:
     if not raw:
         return ""
 
+    def _extract_gfm_table_blocks(input_text: str) -> tuple[str, list[str]]:
+        lines = input_text.split("\n")
+        blocks: list[str] = []
+        output: list[str] = []
+
+        def _is_separator_row(line: str) -> bool:
+            return bool(
+                re.match(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", line)
+            )
+
+        idx = 0
+        while idx < len(lines):
+            header = lines[idx] if idx < len(lines) else ""
+            separator = lines[idx + 1] if idx + 1 < len(lines) else ""
+
+            if "|" in header and _is_separator_row(separator):
+                block = [header, separator]
+                idx += 2
+
+                while idx < len(lines):
+                    row = lines[idx]
+                    if not row.strip() or "|" not in row:
+                        break
+                    block.append(row)
+                    idx += 1
+
+                marker = f"@@TUBETUTOR_TABLE_BLOCK_{len(blocks)}@@"
+                blocks.append("\n".join(block))
+                output.append(marker)
+                continue
+
+            output.append(header)
+            idx += 1
+
+        return "\n".join(output), blocks
+
+    def _restore_gfm_table_blocks(input_text: str, blocks: list[str]) -> str:
+        def _restore(match: re.Match[str]) -> str:
+            try:
+                block_index = int(match.group(1))
+            except (TypeError, ValueError):
+                return ""
+            return blocks[block_index] if 0 <= block_index < len(blocks) else ""
+
+        return re.sub(r"@@TUBETUTOR_TABLE_BLOCK_(\d+)@@", _restore, input_text)
+
     text = raw.replace("\r\n", "\n")
     text = text.replace("\\n", "\n")
+
+    text, table_blocks = _extract_gfm_table_blocks(text)
 
     # Normalize common malformed delimiter patterns.
     text = text.replace("\\$", "$")
@@ -85,6 +139,7 @@ def _sanitize_study_guide_markdown(raw: str) -> str:
 
     text = "\n".join(rebuilt_lines)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    text = _restore_gfm_table_blocks(text, table_blocks)
     return text
 
 # Allow the Next.js frontend to call this API from localhost:3000.
@@ -128,7 +183,13 @@ def get_transcript():
     except NoTranscriptFound:
         return jsonify({"error": "No transcript found for this video."}), 404
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch transcript.", "details": str(exc)}), 500
+        # If direct YouTube transcript fetch fails, fall back to already-processed chunks.
+        try:
+            stored_chunks = get_stored_transcript_chunks(video_id)
+            transcript_segments = [{"text": chunk.get("text", "")} for chunk in stored_chunks]
+            return jsonify({"video_id": video_id, "transcript": transcript_segments}), 200
+        except Exception:
+            return jsonify({"error": "Failed to fetch transcript.", "details": str(exc)}), 500
 
 
 @app.post("/process")
@@ -356,65 +417,8 @@ def generate_study_guide():
         return jsonify({"error": "Missing required field: video_id"}), 400
 
     try:
-        # Fetch full transcript from YouTube
-        transcript = ytt_api.fetch(video_id)
-        transcript_segments = json.loads(JSONFormatter().format_transcript(transcript))
-        
-        # Reconstruct full transcript text
-        full_text = " ".join(
-            str(segment.get("text", "")).strip()
-            for segment in transcript_segments
-            if isinstance(segment, dict)
-        ).strip()
-
-        if not full_text:
-            return jsonify({"error": "Transcript is empty."}), 400
-
-        # Get OpenRouter API key
-        openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-        if not openrouter_api_key:
-            return jsonify({"error": "Missing OPENROUTER_API_KEY environment variable."}), 500
-
-        # Configure LangChain ChatOpenAI for OpenRouter with a free model
-        chat_model = ChatOpenAI(
-            api_key=openrouter_api_key,
-            base_url="https://openrouter.ai/api/v1",
-            model="stepfun/step-3.5-flash:free",
-            temperature=0.7,
-        )
-
-        # System prompt for comprehensive study guide generation
-        system_prompt = (
-            "You are an expert professor and educational content creator. "
-            "Generate a comprehensive, well-structured study guide in valid Markdown based on the provided transcript.\n\n"
-            "Output requirements (strict):\n"
-            "- Use only valid Markdown.\n"
-            "- Use headings with #, ##, ### and put each heading on its own line.\n"
-            "- Use bullet lists with '-' only.\n"
-            "- Do NOT include raw backslashes before dollar signs. Never output \\$ or $$$.\n"
-            "- For inline math use $...$ only.\n"
-            "- For display math use $$...$$ only, and put display math on its own line.\n"
-            "- Never place $$...$$ in the middle of a sentence or bullet line.\n"
-            "- If using matrix notation, keep it valid LaTeX inside $$...$$ (e.g. \\begin{pmatrix} ... \\end{pmatrix}).\n"
-            "- Never mix plain text and heading markers on the same line.\n"
-            "- Return only the study guide Markdown (no preamble, no code fences).\n\n"
-            "The study guide MUST include these sections:\n"
-            "1. Overview (2-3 sentences)\n"
-            "2. Key Concepts (definitions and examples)\n"
-            "3. Takeaways (bulleted learning points)"
-        )
-
-        user_prompt = f"Transcript content:\n\n{full_text}"
-
-        # Invoke the model
-        response = chat_model.invoke(
-            [
-                ("system", system_prompt),
-                ("human", user_prompt),
-            ]
-        )
-
-        cleaned_summary = _sanitize_study_guide_markdown(str(response.content))
+        summary = generate_map_reduce_summary(video_id)
+        cleaned_summary = _sanitize_study_guide_markdown(summary)
 
         return (
             jsonify(
@@ -426,12 +430,8 @@ def generate_study_guide():
             200,
         )
 
-    except TranscriptsDisabled:
-        return jsonify({"error": "Transcripts are disabled for this video."}), 403
-    except (InvalidVideoId, VideoUnavailable):
-        return jsonify({"error": "Invalid or unavailable video_id."}), 404
-    except NoTranscriptFound:
-        return jsonify({"error": "No transcript found for this video."}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     except Exception as exc:
         return jsonify({"error": "Failed to generate study guide.", "details": str(exc)}), 500
 

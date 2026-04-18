@@ -232,7 +232,7 @@ def generate_map_reduce_summary(video_id: str) -> str:
         raise ValueError("No transcript chunks found for this video.")
 
     # Keep LLM call volume bounded for free-tier rate limits on long transcripts.
-    max_map_calls = max(1, int(os.getenv("SUMMARY_MAX_MAP_CALLS", "8")))
+    max_map_calls = max(1, int(os.getenv("SUMMARY_MAX_MAP_CALLS", "4")))
     if len(documents) > max_map_calls:
         group_size = (len(documents) + max_map_calls - 1) // max_map_calls
         grouped_documents: list[Document] = []
@@ -250,10 +250,14 @@ def generate_map_reduce_summary(video_id: str) -> str:
     if not openrouter_api_key:
         raise ValueError("Missing OPENROUTER_API_KEY environment variable.")
 
+    openrouter_model = os.getenv("OPENROUTER_MODEL", "").strip()
+    if not openrouter_model:
+        raise ValueError("Missing OPENROUTER_MODEL environment variable.")
+
     chat_model = ChatOpenAI(
         api_key=openrouter_api_key,
         base_url="https://openrouter.ai/api/v1",
-        model=os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-nano-30b-a3b:free"),
+        model=openrouter_model,
         temperature=0,
     )
 
@@ -303,7 +307,7 @@ def generate_map_reduce_summary(video_id: str) -> str:
             return 0
 
     def _invoke_with_retry(prompt_text: str) -> str:
-        max_attempts = max(1, int(os.getenv("SUMMARY_RETRY_ATTEMPTS", "4")))
+        max_attempts = max(1, int(os.getenv("SUMMARY_RETRY_ATTEMPTS", "2")))
         for attempt in range(max_attempts):
             try:
                 response = chat_model.invoke([("human", prompt_text)])
@@ -339,7 +343,7 @@ def generate_map_reduce_summary(video_id: str) -> str:
             raise ValueError("Could not produce summaries from transcript chunks.")
 
         current_batch = map_summaries
-        batch_size = max(2, int(os.getenv("SUMMARY_REDUCE_BATCH_SIZE", "8")))
+        batch_size = max(2, int(os.getenv("SUMMARY_REDUCE_BATCH_SIZE", "4")))
         while len(current_batch) > 1:
             next_batch: list[str] = []
             for start in range(0, len(current_batch), batch_size):

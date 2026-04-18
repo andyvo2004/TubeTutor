@@ -31,56 +31,8 @@ def _sanitize_study_guide_markdown(raw: str) -> str:
     if not raw:
         return ""
 
-    def _extract_gfm_table_blocks(input_text: str) -> tuple[str, list[str]]:
-        lines = input_text.split("\n")
-        blocks: list[str] = []
-        output: list[str] = []
-
-        def _is_separator_row(line: str) -> bool:
-            return bool(
-                re.match(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", line)
-            )
-
-        idx = 0
-        while idx < len(lines):
-            header = lines[idx] if idx < len(lines) else ""
-            separator = lines[idx + 1] if idx + 1 < len(lines) else ""
-
-            if "|" in header and _is_separator_row(separator):
-                block = [header, separator]
-                idx += 2
-
-                while idx < len(lines):
-                    row = lines[idx]
-                    if not row.strip() or "|" not in row:
-                        break
-                    block.append(row)
-                    idx += 1
-
-                marker = f"@@TUBETUTOR_TABLE_BLOCK_{len(blocks)}@@"
-                blocks.append("\n".join(block))
-                output.append(marker)
-                continue
-
-            output.append(header)
-            idx += 1
-
-        return "\n".join(output), blocks
-
-    def _restore_gfm_table_blocks(input_text: str, blocks: list[str]) -> str:
-        def _restore(match: re.Match[str]) -> str:
-            try:
-                block_index = int(match.group(1))
-            except (TypeError, ValueError):
-                return ""
-            return blocks[block_index] if 0 <= block_index < len(blocks) else ""
-
-        return re.sub(r"@@TUBETUTOR_TABLE_BLOCK_(\d+)@@", _restore, input_text)
-
     text = raw.replace("\r\n", "\n")
     text = text.replace("\\n", "\n")
-
-    text, table_blocks = _extract_gfm_table_blocks(text)
 
     # Normalize common malformed delimiter patterns.
     text = text.replace("\\$", "$")
@@ -139,8 +91,37 @@ def _sanitize_study_guide_markdown(raw: str) -> str:
 
     text = "\n".join(rebuilt_lines)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    text = _restore_gfm_table_blocks(text, table_blocks)
     return text
+
+
+def _extract_json_object(raw: str) -> dict:
+    text = (raw or "").strip()
+    if not text:
+        raise json.JSONDecodeError("Empty response", text, 0)
+
+    # Handle common LLM wrapper style: ```json ... ```
+    fenced_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
+    if fenced_match:
+        text = fenced_match.group(1).strip()
+
+    # Try direct parse first.
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: extract the first top-level JSON object from noisy text.
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = text[start : end + 1]
+        parsed = json.loads(candidate)
+        if isinstance(parsed, dict):
+            return parsed
+
+    raise json.JSONDecodeError("No JSON object found", text, 0)
 
 # Allow the Next.js frontend to call this API from localhost:3000.
 CORS(
@@ -274,10 +255,14 @@ def chat_with_video_context():
         if not openrouter_api_key:
             return jsonify({"error": "Missing OPENROUTER_API_KEY environment variable."}), 500
 
+        openrouter_model = os.getenv("OPENROUTER_MODEL", "").strip()
+        if not openrouter_model:
+            return jsonify({"error": "Missing OPENROUTER_MODEL environment variable."}), 500
+
         chat_model = ChatOpenAI(
             api_key=openrouter_api_key,
             base_url="https://openrouter.ai/api/v1",
-            model=os.getenv("OPENROUTER_MODEL", "stepfun/step-3.5-flash:free"),
+            model=openrouter_model,
             temperature=0,
         )
 
@@ -346,12 +331,15 @@ def generate_quiz():
         if not openrouter_api_key:
             return jsonify({"error": "Missing OPENROUTER_API_KEY environment variable."}), 500
 
+        openrouter_model = os.getenv("OPENROUTER_MODEL", "").strip()
+        if not openrouter_model:
+            return jsonify({"error": "Missing OPENROUTER_MODEL environment variable."}), 500
+
         # Configure LangChain ChatOpenAI for OpenRouter
-        # Using a free model with good JSON generation capabilities
         chat_model = ChatOpenAI(
             api_key=openrouter_api_key,
             base_url="https://openrouter.ai/api/v1",
-            model=os.getenv("OPENROUTER_MODEL", "stepfun/step-3.5-flash:free"),
+            model=openrouter_model,
             temperature=float(os.getenv("QUIZ_TEMPERATURE", "0.8")),
         )
 
@@ -381,13 +369,20 @@ def generate_quiz():
             ]
         )
 
-        # Parse the JSON response
+        # Parse model output and tolerate markdown code-fence wrappers.
         try:
-            quiz_json = json.loads(response.content)
+            quiz_json = _extract_json_object(str(response.content))
         except json.JSONDecodeError as exc:
             return jsonify({
                 "error": "Failed to parse quiz response as valid JSON.",
                 "details": str(exc),
+                "raw_response": response.content
+            }), 500
+
+        if not isinstance(quiz_json, dict) or not isinstance(quiz_json.get("questions"), list):
+            return jsonify({
+                "error": "Invalid quiz format from model.",
+                "details": "Expected a JSON object with a 'questions' array.",
                 "raw_response": response.content
             }), 500
 
